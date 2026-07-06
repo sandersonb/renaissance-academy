@@ -1,0 +1,495 @@
+/**
+ * In-memory repository adapters — for tests and local dev (no MySQL needed).
+ * The production mysql2 adapters implement the same ports against the existing
+ * schema; services depend only on the interfaces.
+ */
+import { randomUUID } from 'node:crypto';
+import { RegStatus } from '../../../domain/regStatus.js';
+import type { Database } from '../../ports/database.js';
+import type {
+  AdminRepo,
+  AdminUserRecord,
+  AppSettings,
+  CapacityRepo,
+  ChildRecord,
+  ChildRepo,
+  CurrentStudentImportRow,
+  LotteryAssignmentRow,
+  LotteryRunRepo,
+  MaintenanceRepo,
+  OutboxEmail,
+  OutboxRepo,
+  SettingsRepo,
+  CurrentStudentRecord,
+  CurrentStudentRepo,
+  ExtraOptionRecord,
+  ExtraTitleRecord,
+  NoteRecord,
+  NoteRepo,
+  ParentRecord,
+  ParentRepo,
+  Repositories,
+  SessionRecord,
+  SessionRepo,
+  SurveyRepo,
+  UserRecord,
+  UserRepo,
+} from '../../ports/repositories.js';
+
+const DEFAULT_CAPS = [160, 120, 120, 120, 110, 100, 100, 80, 30, 50];
+
+export class MemoryStore {
+  users = new Map<number, UserRecord>();
+  parents = new Map<number, ParentRecord>();
+  children = new Map<number, ChildRecord>();
+  currentStudents = new Map<number, CurrentStudentRecord>();
+  sessions = new Map<string, SessionRecord>();
+  extraTitles = new Map<number, ExtraTitleRecord>();
+  extras = new Map<number, ExtraOptionRecord>();
+  childExtra: { childId: number; extraId: number }[] = [];
+  parentExtra: { parentId: number; titleId: number; answer: string }[] = [];
+  admins = new Map<number, AdminUserRecord>();
+  adminSessions = new Map<string, SessionRecord>();
+  notes: NoteRecord[] = [];
+  caps: number[] = [...DEFAULT_CAPS];
+  nextTitleId = 1000;
+  nextExtraId = 1000;
+  lotteryRuns: { id: number; seed: string; year: number; caps: number[]; committed: boolean }[] = [];
+  lotteryAssignments: (LotteryAssignmentRow & { runId: number })[] = [];
+  settings: AppSettings | null = null;
+  outbox: { id: number; recipient: string; template: string; payload: Record<string, unknown>; state: string; attempts: number; lastError: string | null }[] = [];
+  nextOutboxId = 1;
+  nextUserId = 1;
+  nextChildId = 1;
+  nextAdminId = 1;
+  nextNoteId = 1;
+  nextRunId = 1;
+}
+
+const norm = (s: string) => s.trim().toLowerCase();
+
+class MemUserRepo implements UserRepo {
+  constructor(private s: MemoryStore) {}
+  async findByUsername(username: string) {
+    return [...this.s.users.values()].find((u) => u.username === username) ?? null;
+  }
+  async findById(id: number) {
+    return this.s.users.get(id) ?? null;
+  }
+  async create(input: Omit<UserRecord, 'id'>) {
+    const id = this.s.nextUserId++;
+    this.s.users.set(id, { ...input, id });
+    return id;
+  }
+  async setPasswordHash(id: number, pwHash: string, algo: string) {
+    const u = this.s.users.get(id);
+    if (u) {
+      u.pwHash = pwHash;
+      u.pwAlgo = algo;
+    }
+  }
+  async setEncpass(id: number, encpass: string) {
+    const u = this.s.users.get(id);
+    if (u) u.encpass = encpass;
+  }
+  async setStatus(id: number, status: string) {
+    const u = this.s.users.get(id);
+    if (u) u.status = status;
+  }
+}
+
+class MemParentRepo implements ParentRepo {
+  constructor(private s: MemoryStore) {}
+  async create(input: ParentRecord) {
+    this.s.parents.set(input.parentId, { ...input });
+  }
+  async findById(parentId: number) {
+    return this.s.parents.get(parentId) ?? null;
+  }
+  async findByEmail(email: string) {
+    return [...this.s.parents.values()].find((p) => norm(p.email) === norm(email)) ?? null;
+  }
+  async findByEmailAndName(email: string, firstName: string, lastName: string) {
+    return (
+      [...this.s.parents.values()].find(
+        (p) => norm(p.email) === norm(email) && norm(p.firstName) === norm(firstName) && norm(p.lastName) === norm(lastName),
+      ) ?? null
+    );
+  }
+  async findByConfirmToken(token: string) {
+    return [...this.s.parents.values()].find((p) => p.confirmToken === token) ?? null;
+  }
+  async setConfirmToken(parentId: number, token: string, expires: Date) {
+    const p = this.s.parents.get(parentId);
+    if (p) { p.confirmToken = token; p.confirmExpires = expires; }
+  }
+  async findByResetToken(token: string) {
+    return [...this.s.parents.values()].find((p) => p.resetToken === token) ?? null;
+  }
+  async setResetToken(parentId: number, token: string | null, expires: Date | null) {
+    const p = this.s.parents.get(parentId);
+    if (p) { p.resetToken = token; p.resetExpires = expires; }
+  }
+}
+
+class MemChildRepo implements ChildRepo {
+  constructor(private s: MemoryStore) {}
+  async findByParent(parentId: number) {
+    return [...this.s.children.values()].filter((c) => c.parentId === parentId);
+  }
+  async findById(childId: number) {
+    return this.s.children.get(childId) ?? null;
+  }
+  async all() {
+    return [...this.s.children.values()];
+  }
+  async searchByName(query: string) {
+    const q = norm(query);
+    return [...this.s.children.values()].filter(
+      (c) => norm(c.firstName).includes(q) || norm(c.lastName).includes(q),
+    );
+  }
+  async waitlist(grade?: number) {
+    return [...this.s.children.values()]
+      .filter((c) => (c.regStatus === RegStatus.WAIT || c.regStatus === RegStatus.SIB_WAIT) && (grade === undefined || c.gradeNextYear === grade))
+      .sort((a, b) => a.gradeNextYear - b.gradeNextYear || a.regStatus.localeCompare(b.regStatus) || (a.position ?? 0) - (b.position ?? 0));
+  }
+  async byStatuses(statuses: RegStatus[]) {
+    const set = new Set(statuses);
+    return [...this.s.children.values()].filter((c) => set.has(c.regStatus));
+  }
+  async existsByIdentity(firstName: string, middleName: string, lastName: string, dob: string) {
+    return [...this.s.children.values()].some((c) => {
+      if (c.dob !== dob || norm(c.lastName) !== norm(lastName)) return false;
+      const f = norm(firstName), m = norm(middleName);
+      return norm(c.firstName) === f || norm(c.firstName) === m || norm(c.middleName ?? '') === f;
+    });
+  }
+  async create(input: Omit<ChildRecord, 'childId'>) {
+    const childId = this.s.nextChildId++;
+    this.s.children.set(childId, { ...input, childId });
+    return childId;
+  }
+  async updateStatus(childId: number, status: RegStatus, position?: number | null) {
+    const c = this.s.children.get(childId);
+    if (c) {
+      c.regStatus = status;
+      if (position !== undefined) c.position = position;
+    }
+  }
+  async setPosition(childId: number, position: number | null) {
+    const c = this.s.children.get(childId);
+    if (c) c.position = position;
+  }
+  async setExpiration(childId: number, date: string | null) {
+    const c = this.s.children.get(childId);
+    if (c) c.expiration = date;
+  }
+  async setLanguagePreference(childId: number, pref: string | null) {
+    const c = this.s.children.get(childId);
+    if (c) c.languagePreference = pref;
+  }
+  async updateFields(childId: number, fields: Partial<Pick<ChildRecord, 'firstName' | 'middleName' | 'lastName' | 'gender' | 'gradeNextYear'>>) {
+    const c = this.s.children.get(childId);
+    if (c) Object.assign(c, fields);
+  }
+  async delete(childId: number) {
+    this.s.children.delete(childId);
+  }
+}
+
+class MemSurveyRepo implements SurveyRepo {
+  constructor(private s: MemoryStore) {}
+  async listTitles(lotteryQuestion: number) {
+    return [...this.s.extraTitles.values()]
+      .filter((t) => t.lotteryQuestion === lotteryQuestion && t.active)
+      .sort((a, b) => a.sortOrder - b.sortOrder);
+  }
+  async options(titleId: number) {
+    return [...this.s.extras.values()].filter((e) => e.titleId === titleId);
+  }
+  async childAnsweredTitleIds(childId: number) {
+    const ids = new Set<number>();
+    for (const ce of this.s.childExtra) {
+      if (ce.childId === childId) {
+        const ex = this.s.extras.get(ce.extraId);
+        if (ex) ids.add(ex.titleId);
+      }
+    }
+    return ids;
+  }
+  async addChildAnswer(childId: number, extraId: number) {
+    this.s.childExtra.push({ childId, extraId });
+  }
+  async clearChildAnswers(childId: number) {
+    this.s.childExtra = this.s.childExtra.filter((ce) => ce.childId !== childId);
+  }
+  async parentAnsweredTitleIds(parentId: number) {
+    return new Set(this.s.parentExtra.filter((p) => p.parentId === parentId).map((p) => p.titleId));
+  }
+  async addParentAnswer(parentId: number, titleId: number, answer: string) {
+    this.s.parentExtra.push({ parentId, titleId, answer });
+  }
+  async listAllTitles() {
+    return [...this.s.extraTitles.values()].sort(
+      (a, b) => a.lotteryQuestion - b.lotteryQuestion || a.sortOrder - b.sortOrder,
+    );
+  }
+  async createTitle(input: Omit<ExtraTitleRecord, 'titleId'>) {
+    const titleId = this.s.nextTitleId++;
+    this.s.extraTitles.set(titleId, { titleId, ...input });
+    return titleId;
+  }
+  async updateTitle(titleId: number, fields: Partial<Omit<ExtraTitleRecord, 'titleId'>>) {
+    const t = this.s.extraTitles.get(titleId);
+    if (t) Object.assign(t, fields);
+  }
+  async addOption(titleId: number, value: string) {
+    const extraId = this.s.nextExtraId++;
+    this.s.extras.set(extraId, { extraId, titleId, value });
+    return extraId;
+  }
+  async updateOption(extraId: number, value: string) {
+    const e = this.s.extras.get(extraId);
+    if (e) e.value = value;
+  }
+  async deleteOption(extraId: number) {
+    this.s.extras.delete(extraId);
+  }
+}
+
+class MemCurrentStudentRepo implements CurrentStudentRepo {
+  constructor(private s: MemoryStore) {}
+  async findMatch(firstName: string, lastName: string, dob: string) {
+    return (
+      [...this.s.currentStudents.values()].find(
+        (c) => norm(c.firstName) === norm(firstName) && norm(c.lastName) === norm(lastName) && c.dob === dob,
+      ) ?? null
+    );
+  }
+  async setStatus(childId: number, status: RegStatus) {
+    const c = this.s.currentStudents.get(childId);
+    if (c) c.regStatus = status;
+  }
+}
+
+class MemSessionRepo implements SessionRepo {
+  constructor(private map: Map<string, SessionRecord>) {}
+  async create(userId: number, ttlMs: number) {
+    const rec: SessionRecord = {
+      token: randomUUID().replace(/-/g, ''),
+      userId,
+      issuedAt: new Date(),
+      expiresAt: new Date(Date.now() + ttlMs),
+    };
+    this.map.set(rec.token, rec);
+    return rec;
+  }
+  async find(token: string) {
+    const r = this.map.get(token);
+    if (!r) return null;
+    if (r.expiresAt.getTime() < Date.now()) {
+      this.map.delete(token);
+      return null;
+    }
+    return r;
+  }
+  async destroy(token: string) {
+    this.map.delete(token);
+  }
+}
+
+class MemAdminRepo implements AdminRepo {
+  constructor(private s: MemoryStore) {}
+  async findByUsername(u: string) {
+    return [...this.s.admins.values()].find((a) => a.username === u) ?? null;
+  }
+  async findById(id: number) {
+    return this.s.admins.get(id) ?? null;
+  }
+  async create(username: string, pwHash: string, pwAlgo: string) {
+    const id = this.s.nextAdminId++;
+    this.s.admins.set(id, { id, username, pwHash, pwAlgo, active: true });
+    return id;
+  }
+  async countActive() {
+    return [...this.s.admins.values()].filter((a) => a.active).length;
+  }
+  async list() {
+    return [...this.s.admins.values()];
+  }
+  async setActive(id: number, active: boolean) {
+    const a = this.s.admins.get(id);
+    if (a) a.active = active;
+  }
+}
+
+class MemNoteRepo implements NoteRepo {
+  constructor(private s: MemoryStore) {}
+  async add(parentId: number, note: string) {
+    this.s.notes.push({ id: this.s.nextNoteId++, parentId, date: new Date().toISOString(), note });
+  }
+  async listByParent(parentId: number) {
+    return this.s.notes.filter((n) => n.parentId === parentId);
+  }
+}
+
+class MemCapacityRepo implements CapacityRepo {
+  constructor(private s: MemoryStore) {}
+  async gradeCaps() {
+    return [...this.s.caps];
+  }
+}
+
+class MemLotteryRunRepo implements LotteryRunRepo {
+  constructor(private s: MemoryStore) {}
+  async createRun(input: { seed: string; year: number; caps: number[]; committed: boolean }) {
+    const id = this.s.nextRunId++;
+    this.s.lotteryRuns.push({ id, ...input });
+    return id;
+  }
+  async addAssignments(runId: number, rows: LotteryAssignmentRow[]) {
+    for (const r of rows) this.s.lotteryAssignments.push({ runId, ...r });
+  }
+}
+
+class MemSettingsRepo implements SettingsRepo {
+  constructor(private s: MemoryStore) {}
+  async get() {
+    return this.s.settings;
+  }
+  async set(v: AppSettings) {
+    this.s.settings = { ...v };
+  }
+}
+
+class MemOutboxRepo implements OutboxRepo {
+  constructor(private s: MemoryStore) {}
+  async enqueue(recipient: string, template: string, payload: Record<string, unknown>) {
+    const id = this.s.nextOutboxId++;
+    this.s.outbox.push({ id, recipient, template, payload, state: 'pending', attempts: 0, lastError: null });
+    return id;
+  }
+  async claimPending(limit: number): Promise<OutboxEmail[]> {
+    return this.s.outbox.filter((m) => m.state === 'pending').slice(0, limit)
+      .map((m) => ({ id: m.id, recipient: m.recipient, template: m.template, payload: m.payload, attempts: m.attempts }));
+  }
+  async markSent(id: number) {
+    const m = this.s.outbox.find((x) => x.id === id);
+    if (m) m.state = 'sent';
+  }
+  async markFailed(id: number, error: string, maxAttempts: number) {
+    const m = this.s.outbox.find((x) => x.id === id);
+    if (m) { m.attempts++; m.lastError = error; m.state = m.attempts >= maxAttempts ? 'failed' : 'pending'; }
+  }
+  async countByState() {
+    const out: Record<string, number> = {};
+    for (const m of this.s.outbox) out[m.state] = (out[m.state] ?? 0) + 1;
+    return out;
+  }
+}
+
+class MemMaintenanceRepo implements MaintenanceRepo {
+  constructor(private s: MemoryStore) {}
+  async purgeForNewYear() {
+    this.s.children.clear();
+    this.s.parents.clear();
+    this.s.users.clear();
+    this.s.currentStudents.clear();
+    this.s.sessions.clear();
+    this.s.notes = [];
+    this.s.parentExtra = [];
+    this.s.childExtra = [];
+    this.s.lotteryRuns = [];
+    this.s.lotteryAssignments = [];
+    // Preserved: admins, adminSessions, extraTitles, extras, caps (reference).
+  }
+  async importCurrentStudents(rows: CurrentStudentImportRow[]) {
+    let id = 1;
+    for (const r of rows) {
+      this.s.currentStudents.set(id, {
+        childId: id, lastName: r.lastName, firstName: r.firstName, middleName: r.middleName,
+        gender: r.gender, dob: r.dob, regStatus: RegStatus.PEND_REENROLL, grade: r.grade,
+      });
+      id++;
+    }
+    return rows.length;
+  }
+}
+
+export function createMemoryRepositories(store = new MemoryStore()): Repositories & { store: MemoryStore } {
+  return {
+    store,
+    users: new MemUserRepo(store),
+    parents: new MemParentRepo(store),
+    children: new MemChildRepo(store),
+    currentStudents: new MemCurrentStudentRepo(store),
+    sessions: new MemSessionRepo(store.sessions),
+    survey: new MemSurveyRepo(store),
+    admins: new MemAdminRepo(store),
+    adminSessions: new MemSessionRepo(store.adminSessions),
+    notes: new MemNoteRepo(store),
+    capacity: new MemCapacityRepo(store),
+    lotteryRuns: new MemLotteryRunRepo(store),
+    settings: new MemSettingsRepo(store),
+    maintenance: new MemMaintenanceRepo(store),
+    outbox: new MemOutboxRepo(store),
+  };
+}
+
+/**
+ * In-memory Database with snapshot/restore "transactions" so tests exercise the
+ * same atomic semantics: on error, all writes within the work fn are rolled back.
+ */
+export function createMemoryDatabase(store = new MemoryStore()): Database & { store: MemoryStore; repos: Repositories } {
+  const repos = createMemoryRepositories(store);
+  return {
+    store,
+    repos,
+    async transaction<T>(work: (tx: Repositories) => Promise<T>): Promise<T> {
+      const snap = structuredClone({
+        users: store.users, parents: store.parents, children: store.children,
+        currentStudents: store.currentStudents, sessions: store.sessions,
+        extraTitles: store.extraTitles, extras: store.extras, childExtra: store.childExtra,
+        parentExtra: store.parentExtra, admins: store.admins, adminSessions: store.adminSessions,
+        notes: store.notes, caps: store.caps, lotteryRuns: store.lotteryRuns,
+        lotteryAssignments: store.lotteryAssignments, settings: store.settings, outbox: store.outbox,
+        nextUserId: store.nextUserId, nextChildId: store.nextChildId, nextAdminId: store.nextAdminId,
+        nextNoteId: store.nextNoteId, nextRunId: store.nextRunId, nextTitleId: store.nextTitleId,
+        nextExtraId: store.nextExtraId, nextOutboxId: store.nextOutboxId,
+      });
+      try {
+        return await work(repos);
+      } catch (e) {
+        Object.assign(store, snap); // restore on failure (rollback)
+        throw e;
+      }
+    },
+  };
+}
+
+/** Seed a representative, fully data-driven question set (subset of the real
+ *  ExtraTitles/Extra, now with input_type/active/sort_order). */
+export function seedSurvey(store: MemoryStore): void {
+  const titles: ExtraTitleRecord[] = [
+    { titleId: 6, question: 'Which Kindergarten session would you prefer?', grade: '-0-', lotteryQuestion: 0, brief: 'K Session', inputType: 'single_select', active: true, sortOrder: 10 },
+    { titleId: 10, question: 'Which language would be your first preference?', grade: '-2-3-4-5-', lotteryQuestion: 0, brief: 'Language', inputType: 'single_select', active: true, sortOrder: 20 },
+    { titleId: 20, question: 'How did you find out about us?', grade: null, lotteryQuestion: 1, brief: 'referredby', inputType: 'text', active: true, sortOrder: 10 },
+    { titleId: 17, question: 'How many times have you visited?', grade: null, lotteryQuestion: 1, brief: 'visit_count', inputType: 'single_select', active: true, sortOrder: 20 },
+    { titleId: 11, question: 'What influenced your decision to apply?', grade: null, lotteryQuestion: 1, brief: 'pushmarket', inputType: 'multi_select', active: true, sortOrder: 30 },
+  ];
+  const options: ExtraOptionRecord[] = [
+    { extraId: 1, titleId: 6, value: 'AM' },
+    { extraId: 2, titleId: 6, value: 'PM' },
+    { extraId: 13, titleId: 10, value: 'Spanish' },
+    { extraId: 12, titleId: 10, value: 'Arabic' },
+    { extraId: 50, titleId: 17, value: '0' },
+    { extraId: 51, titleId: 17, value: '2 - 3' },
+    // pushmarket options that legacy hardcoded in Perl — now data:
+    { extraId: 60, titleId: 11, value: 'World language program' },
+    { extraId: 61, titleId: 11, value: 'After-school programs' },
+    { extraId: 62, titleId: 11, value: 'Small class sizes' },
+  ];
+  for (const t of titles) store.extraTitles.set(t.titleId, t);
+  for (const o of options) store.extras.set(o.extraId, o);
+}
