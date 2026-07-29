@@ -7,7 +7,7 @@ import { buildServer } from '../src/app/http/server.js';
 const config: AppConfig = {
   yearBegin: 2026, lotteryOpen: true, postLottery: false,
   offerExpirationDays: 3, paperworkExpirationDays: 5, bcryptCost: 4, dualWriteLegacyCrypt: true,
-  appBaseUrl: 'http://test', childEditableFields: [], adminIpAllowlist: [], trustProxy: false,
+  appBaseUrl: 'http://test', childEditableFields: [], adminIpAllowlist: [], trustProxy: false, emailBatchSize: 20, emailSendSpacingMs: 0, emailDailyCap: 400,
 };
 
 let app: FastifyInstance;
@@ -51,7 +51,7 @@ describe('parent HTTP flow', () => {
 
     me = await app.inject({ method: 'GET', url: '/api/me', headers: { cookie } });
     expect(me.json().children).toHaveLength(1);
-    expect(me.json().children[0].statusLabel).toBe('Awaiting lottery');
+    expect(me.json().children[0].statusLabel).toBe('Awaiting Lottery');
   });
 
   it('rejects unauthenticated dashboard access', async () => {

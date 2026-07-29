@@ -7,7 +7,7 @@ import type { PasswordOps } from '../src/app/services/password.js';
 const config: AppConfig = {
   yearBegin: 2026, lotteryOpen: true, postLottery: false,
   offerExpirationDays: 3, paperworkExpirationDays: 5, bcryptCost: 4, dualWriteLegacyCrypt: true,
-  appBaseUrl: 'http://test', childEditableFields: [], adminIpAllowlist: [], trustProxy: false,
+  appBaseUrl: 'http://test', childEditableFields: [], adminIpAllowlist: [], trustProxy: false, emailBatchSize: 20, emailSendSpacingMs: 0, emailDailyCap: 400,
 };
 
 // Deterministic fake so unit tests don't depend on the bcrypt/crypt libs.
@@ -70,11 +70,12 @@ describe('AuthService', () => {
     expect(session.token).toBeTruthy();
   });
 
-  it('rejects a wrong password', async () => {
+  it('gives the same generic error for a wrong password and an unknown user (no enumeration)', async () => {
     const { auth } = svc();
     const { confirmToken } = await auth.register(baseReg);
     await auth.confirm(confirmToken);
-    await expect(auth.login('parent1', 'nope')).rejects.toThrow(/wrong password/);
+    await expect(auth.login('parent1', 'nope')).rejects.toThrow('Invalid username or password.');
+    await expect(auth.login('ghost', 'whatever')).rejects.toThrow('Invalid username or password.');
   });
 
   it('verifies a legacy crypt() user and upgrades them to bcrypt on login', async () => {

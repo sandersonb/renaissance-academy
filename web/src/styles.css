@@ -104,3 +104,64 @@ th { color: var(--muted); font-weight: 600; }
 }
 .survey .question { font-weight: 600; margin-top: 0; }
 .center { text-align: center; }
+
+/* Admin dashboard capacity table (grade x status). */
+.table-scroll { overflow-x: auto; }
+table.summary { min-width: 640px; }
+table.summary th, table.summary td { text-align: right; white-space: nowrap; padding: 0.4rem 0.6rem; }
+table.summary th.rowlabel { text-align: left; color: var(--text); font-weight: 600; }
+table.summary thead th { color: var(--muted); border-bottom: 2px solid var(--border); }
+table.summary .total { border-left: 1px solid var(--border); font-weight: 600; }
+table.summary tr.row-head th, table.summary tr.row-head td { background: #eef2f6; }
+table.summary tr.row-open th, table.summary tr.row-open td {
+  border-top: 2px solid var(--border);
+  background: #f0f6ef;
+  font-weight: 600;
+}
+table.summary thead th a { color: inherit; text-decoration: none; }
+table.summary thead th a:hover { text-decoration: underline; }
+table.summary td a { text-decoration: none; }
+table.summary td a:hover { text-decoration: underline; }
+table.summary tr.row-group-start th, table.summary tr.row-group-start td { border-top: 2px solid var(--border); }
+.info-btn {
+  background: none; border: none; color: var(--muted); cursor: pointer;
+  font-size: 1rem; padding: 0; margin: 0 0.4rem 0 0; width: auto; line-height: 1;
+  vertical-align: baseline;
+}
+.info-btn:hover, .info-btn[aria-expanded='true'] { color: var(--blue); }
+table.summary tr.info-row td {
+  text-align: left; white-space: normal; background: #f7f9fb;
+  color: var(--text); font-size: 0.88rem; padding: 0.5rem 0.7rem;
+}
+
+/* Admin family detail + CRUD forms */
+.card-head { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; }
+.card-head h2 { margin: 0; }
+.field-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.6rem; margin-top: 0.6rem; }
+.field-grid label { display: flex; flex-direction: column; font-size: 0.85rem; color: var(--muted); gap: 0.2rem; }
+.field-grid input, .field-grid select { color: var(--text); }
+.row-actions { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 0.5rem; margin-top: 0.6rem; }
+label.inline { display: flex; flex-direction: column; font-size: 0.85rem; color: var(--muted); gap: 0.2rem; }
+label.inline select { color: var(--text); }
+.subcard { border: 1px solid var(--border); border-radius: 7px; padding: 0.7rem 0.9rem; margin-top: 0.7rem; }
+dl.detail { margin: 0.4rem 0 0; }
+dl.detail > div { display: flex; gap: 0.6rem; padding: 0.25rem 0; border-bottom: 1px solid #eef1f4; }
+dl.detail dt { flex: 0 0 9rem; color: var(--muted); font-size: 0.9rem; }
+dl.detail dd { margin: 0; }
+ul.answers { margin: 0.4rem 0; padding-left: 1.1rem; font-size: 0.9rem; }
+.warn-box { background: #fff8e6; border: 1px solid #e6cf8a; border-radius: 7px; padding: 0.6rem 0.8rem; margin-top: 0.6rem; font-size: 0.9rem; }
+.card button.link { color: var(--blue); }
+
+/* Settings: section headings + toggle rows */
+h2.section { color: var(--blue-dark); border-bottom: 2px solid var(--border); padding-bottom: 0.3rem; margin-top: 1.6rem; }
+label.toggle { display: flex; align-items: flex-start; gap: 0.6rem; margin: 0.7rem 0; font-size: 0.92rem; }
+label.toggle input { width: auto; margin-top: 0.15rem; flex: 0 0 auto; }
+label.toggle span { flex: 1; }
+
+/* Reports: answer tally bars */
+table.tally { margin-top: 0.4rem; }
+table.tally td { border-bottom: none; padding: 0.2rem 0.5rem; vertical-align: middle; }
+table.tally .tally-label { width: 30%; font-size: 0.9rem; }
+table.tally .tally-bar { width: 60%; }
+table.tally .tally-bar .bar { display: inline-block; height: 0.8rem; background: var(--blue); border-radius: 3px; min-width: 2px; }
+table.tally .tally-count { width: 10%; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }

@@ -47,18 +47,25 @@ export class NotifyService {
     });
   }
 
-  /** notify_email.pl (default mode): daily reminder to anyone with an open item. */
-  async sendReminders(): Promise<{ emails: number }> {
+  /**
+   * notify_email.pl (default mode): reminder to anyone with an open item. Skips
+   * recipients who already have a pending reminder queued, so calling this
+   * repeatedly (manually or on the daily schedule) can't pile up duplicates —
+   * the worker paces delivery, so a reminder just waits its turn.
+   */
+  async sendReminders(): Promise<{ emails: number; skipped: number }> {
     const kids = await this.repos.children.byStatuses(REMINDER_STATUSES);
     const parents = new Set(kids.map((k) => k.parentId));
+    const alreadyQueued = await this.repos.outbox.pendingRecipients('reminder');
     let emails = 0;
+    let skipped = 0;
     for (const pid of parents) {
       const parent = await this.repos.parents.findById(pid);
-      if (parent?.email) {
-        await this.repos.outbox.enqueue(parent.email, 'reminder', { firstName: parent.firstName, link: this.link() });
-        emails++;
-      }
+      if (!parent?.email) continue;
+      if (alreadyQueued.has(parent.email)) { skipped++; continue; }
+      await this.repos.outbox.enqueue(parent.email, 'reminder', { firstName: parent.firstName, link: this.link() });
+      emails++;
     }
-    return { emails };
+    return { emails, skipped };
   }
 }

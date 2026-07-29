@@ -117,8 +117,15 @@ export interface UserRepo {
   setStatus(id: number, status: string): Promise<void>;
 }
 
+/** Demographic parent fields an admin may edit (identity/tokens excluded). */
+export type EditableParentFields = Partial<
+  Pick<ParentRecord, 'firstName' | 'lastName' | 'relationship' | 'address' | 'city' | 'state' | 'zip'
+    | 'homePhone' | 'otherPhone' | 'email' | 'alternateEmail'>
+>;
+
 export interface ParentRepo {
   create(input: ParentRecord): Promise<void>;
+  update(parentId: number, fields: EditableParentFields): Promise<void>;
   findById(parentId: number): Promise<ParentRecord | null>;
   findByEmail(email: string): Promise<ParentRecord | null>;
   findByEmailAndName(email: string, firstName: string, lastName: string): Promise<ParentRecord | null>;
@@ -148,9 +155,28 @@ export interface ChildRepo {
   setLanguagePreference(childId: number, pref: string | null): Promise<void>;
   updateFields(
     childId: number,
-    fields: Partial<Pick<ChildRecord, 'firstName' | 'middleName' | 'lastName' | 'gender' | 'gradeNextYear'>>,
+    fields: Partial<Pick<ChildRecord, 'firstName' | 'middleName' | 'lastName' | 'gender' | 'gradeNextYear' | 'dob'>>,
   ): Promise<void>;
   delete(childId: number): Promise<void>;
+}
+
+export interface SurveyAnswer {
+  titleId: number;
+  question: string;
+  brief: string | null;
+  value: string | null;
+}
+
+/** One individual survey response, for the admin reports page (child + parent answers). */
+export interface SurveyResponseRow {
+  titleId: number;
+  question: string;
+  brief: string | null;
+  lotteryQuestion: number; // 0 = registration (child), 1 = lottery (parent)
+  value: string;
+  subject: string; // student name (registration) or parent name (lottery)
+  grade: number | null; // student's next-year grade for registration Qs; null for parent Qs
+  parentId: number;
 }
 
 export interface SurveyRepo {
@@ -159,6 +185,10 @@ export interface SurveyRepo {
   options(titleId: number): Promise<ExtraOptionRecord[]>;
   // Child answers (ChildExtra -> Extra): which titles a child has answered.
   childAnsweredTitleIds(childId: number): Promise<Set<number>>;
+  /** A child's survey answers joined to their question label (show_family "Extras"). */
+  childAnswers(childId: number): Promise<SurveyAnswer[]>;
+  /** Every survey response (child + parent) for the admin reports page. */
+  surveyResponses(): Promise<SurveyResponseRow[]>;
   addChildAnswer(childId: number, extraId: number): Promise<void>;
   clearChildAnswers(childId: number): Promise<void>;
   // Parent answers (ParentExtra): keyed by Title_ID directly.
@@ -177,6 +207,12 @@ export interface CurrentStudentRepo {
   /** Re-enrollment match: First + Last + DOB (gender intentionally ignored). */
   findMatch(firstName: string, lastName: string, dob: string): Promise<CurrentStudentRecord | null>;
   setStatus(childId: number, status: RegStatus): Promise<void>;
+  // Roster CRUD (admin data management — replaces phpMyAdmin on Current_Student):
+  all(): Promise<CurrentStudentRecord[]>;
+  findById(childId: number): Promise<CurrentStudentRecord | null>;
+  create(input: Omit<CurrentStudentRecord, 'childId'>): Promise<number>;
+  update(childId: number, fields: Partial<Omit<CurrentStudentRecord, 'childId'>>): Promise<void>;
+  delete(childId: number): Promise<void>;
 }
 
 export interface SessionRepo {
@@ -202,6 +238,8 @@ export interface NoteRepo {
 export interface CapacityRepo {
   /** Per-grade caps (index 0..9) from MaxEnrollment. */
   gradeCaps(): Promise<number[]>;
+  /** Replace the per-grade caps (index 0..9) in MaxEnrollment. */
+  setCaps(caps: number[]): Promise<void>;
 }
 
 export interface LotteryAssignmentRow {
@@ -213,9 +251,22 @@ export interface LotteryAssignmentRow {
   viaSibling: boolean;
 }
 
+export interface LotteryRunSummary {
+  id: number;
+  seed: string;
+  year: number;
+  ranAt: string | null;
+  committed: boolean;
+  offered: number;
+  waitlisted: number;
+  sibWait: number;
+}
+
 export interface LotteryRunRepo {
   createRun(input: { seed: string; year: number; caps: number[]; committed: boolean }): Promise<number>;
   addAssignments(runId: number, rows: LotteryAssignmentRow[]): Promise<void>;
+  /** Most-recent runs (newest first) with per-run placement counts, for the audit history. */
+  listRuns(limit: number): Promise<LotteryRunSummary[]>;
 }
 
 export interface AppSettings {
@@ -254,6 +305,43 @@ export interface OutboxRepo {
   /** Increment attempts; re-queue (pending) until maxAttempts, then mark failed. */
   markFailed(id: number, error: string, maxAttempts: number): Promise<void>;
   countByState(): Promise<Record<string, number>>;
+  /** How many messages were sent since `since` — drives the daily send cap. */
+  countSentSince(since: Date): Promise<number>;
+  /** Recipients that already have a pending message of this template (dedup). */
+  pendingRecipients(template: string): Promise<Set<string>>;
+  /** Most-recent messages (newest first), optionally filtered by state — for the admin log. */
+  recent(limit: number, state?: string): Promise<OutboxLogRow[]>;
+}
+
+export interface DocumentMeta {
+  slug: string;
+  filename: string;
+  contentType: string;
+  size: number;
+  uploadedAt: string | null;
+  uploadedBy: number | null;
+}
+export interface DocumentFile extends DocumentMeta {
+  bytes: Buffer;
+}
+export interface DocumentRepo {
+  /** Metadata for all stored documents (no bytes). */
+  list(): Promise<DocumentMeta[]>;
+  getMeta(slug: string): Promise<DocumentMeta | null>;
+  getFile(slug: string): Promise<DocumentFile | null>;
+  upsert(input: { slug: string; filename: string; contentType: string; bytes: Buffer; size: number; uploadedBy: number | null }): Promise<void>;
+  delete(slug: string): Promise<void>;
+}
+
+export interface OutboxLogRow {
+  id: number;
+  recipient: string;
+  template: string;
+  state: string;
+  attempts: number;
+  lastError: string | null;
+  createdAt: string | null;
+  sentAt: string | null;
 }
 
 /** Annual reset operations (RULES_SPEC §2.1). */
@@ -279,4 +367,5 @@ export interface Repositories {
   settings: SettingsRepo;
   maintenance: MaintenanceRepo;
   outbox: OutboxRepo;
+  documents: DocumentRepo;
 }

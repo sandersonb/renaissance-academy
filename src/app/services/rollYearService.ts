@@ -13,6 +13,7 @@
  * happens before any destructive step, so a bad CSV can't wipe data.
  */
 import { parseRoster } from '../../domain/rosterCsv.js';
+import type { AppConfig } from '../config.js';
 import type { Database } from '../ports/database.js';
 
 export class RollYearError extends Error {}
@@ -25,7 +26,7 @@ export interface RollValidation {
 }
 
 export class RollYearService {
-  constructor(private db: Database) {}
+  constructor(private db: Database, private config?: AppConfig) {}
 
   validate(csv: string): RollValidation {
     const { rows, errors } = parseRoster(csv);
@@ -52,6 +53,12 @@ export class RollYearService {
       await tx.settings.set({ yearBegin, lotteryOpen: true, postLottery: false });
       return n;
     });
+    // Apply the new year + reset gates live (shared config object).
+    if (this.config) {
+      this.config.yearBegin = yearBegin;
+      this.config.lotteryOpen = true;
+      this.config.postLottery = false;
+    }
     return { imported };
   }
 }

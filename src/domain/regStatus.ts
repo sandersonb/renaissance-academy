@@ -28,19 +28,23 @@ export const RegStatus = {
 
 export type RegStatus = (typeof RegStatus)[keyof typeof RegStatus];
 
-/** Admin-facing labels (from Enrollment.pm `$humanify`). */
+/**
+ * Canonical human-readable status labels (revised from Enrollment.pm `$humanify`
+ * to be literal + consistent). Each label mirrors its Reg_Status; used on badges,
+ * the family view, the drill-down list, and the dashboard rows.
+ */
 export const HUMANIFY: Record<RegStatus, string> = {
-  PEND_REENROLL: '',
-  IP_REENROLL: 'Re-enrollment Incomplete',
-  ACPT_REENROLL: 'Returning Student',
-  DECL_REENROLL: 'Declined Enrollment',
-  INITIAL: 'Awaiting lottery',
+  PEND_REENROLL: 'Re-Enrollment Pending',
+  IP_REENROLL: 'Re-Enrollment In Progress',
+  ACPT_REENROLL: 'Accepted Re-Enrollment',
+  DECL_REENROLL: 'Declined Re-Enrollment',
+  INITIAL: 'Awaiting Lottery',
   PEND_OFFER: 'Offer Pending',
   OFFER: 'Offer Extended',
-  IP_OFFER: 'Acceptance in Progress',
-  WAIT: 'On Waiting List',
-  SIB_WAIT: 'On Sibling Wait List',
-  DECLINE: 'Declined',
+  IP_OFFER: 'Acceptance In Progress',
+  WAIT: 'Waitlisted',
+  SIB_WAIT: 'Sibling Waitlisted',
+  DECLINE: 'Declined Offer',
   PEND_REGISTER: 'Awaiting Paperwork',
   FIN_REGISTER: 'Paperwork Incomplete',
   REGISTER: 'Registered',

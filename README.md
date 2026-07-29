@@ -9,6 +9,21 @@ is driven by analysis, not a static port. See:
 - **`old/`** — the live Perl app (gitignored; contains secrets/PII).
 - **`cursor/`** — an earlier static-port attempt (reference only).
 
+## Documentation
+
+- **[`docs/`](docs/)** — guidebooks for three audiences:
+  [IT](docs/it/) (deploy, DB upgrades, nginx + TLS, CLI/env reference),
+  [admin staff](docs/admin/) (using the portal), and
+  [parents](docs/parents/) (applying, offers, paperwork).
+- **[`CLAUDE.md`](CLAUDE.md)** — repo orientation for developers / AI assistants
+  (architecture, commands, conventions).
+- **[`openspec/`](openspec/)** — spec-driven records: current capability specs
+  (`openspec/specs/`) and the rebuild change to be archived at cutover.
+
+The app is **feature-complete** across parent portal, admin console, lottery,
+notifications, surveys, documents, and the annual cycle; remaining work is
+production cutover. The milestone history below is kept for context.
+
 ## Status
 
 **M1 — Domain core (complete, tested).** Framework-free TypeScript (`src/domain/`):
@@ -70,12 +85,14 @@ state-machine rules) → add note; waitlist. Admin UI under `/admin` in `web/`.
 - **Access control:** IP-restricted — `nginx` is the primary gate
   (`deploy/nginx.conf.example`); app-level `ADMIN_IP_ALLOWLIST` + `TRUST_PROXY`
   are defense-in-depth.
-- **Run Lottery** (admin): **preview** (dry run, no writes) → review summary →
-  **commit** the *same seed* to apply the exact previewed draw. Commit records an
-  **immutable draw log** (`lottery_run`/`lottery_assignment` with the seed, so a
-  draw is reproducible/auditable — deviation B3) and places every student. UI at
-  `/admin/lottery`. Verified on real MySQL (preview non-destructive; commit
-  applies + logs; seed-reproducible).
+- **Run Lottery** (admin): **preview** (dry run, no writes, one random *sample*) →
+  review the summary → **run the official lottery**, which draws a **fresh
+  server-side seed that is never the previewed one** (fairness/legal requirement —
+  a preview can't be reused as the outcome). The official run records an
+  **immutable draw log** (`lottery_run`/`lottery_assignment` with the recorded
+  seed, so the result is auditable after the fact), places every student, sets
+  `post_lottery=1`, and blocks a re-run. Past runs are listed on the page. UI at
+  `/admin/lottery`.
 - **Start New Year** (admin, the December reset as a guarded action): upload the
   current-student roster CSV → **validate** (parses with the bug fixes: header
   skipped, dates read as M/D/YYYY) → **commit** = purge the per-year tables +
@@ -127,6 +144,21 @@ npm install && npm start                      # API on :3001 (in-memory if DB_HO
 cd web && npm install && npm run dev           # React on :5173 (proxies /api)
 # For a real DB: load db/schema.sql into MySQL, set DB_HOST, run `npm run db:migrate`
 ```
+
+**Sample data** (needs `DB_HOST` + migrations applied):
+```bash
+npm run db:seed:pre                           # pre-lottery: applicants awaiting the draw;
+                                              #   small grades oversubscribed so a real draw waitlists
+npm run db:seed:post                          # post-lottery: offers, waitlists, paperwork, registered —
+                                              #   a spread across every status
+npm run db:seed -- --only=current-students    # ONLY (re)load the Current_Student roster
+npm run db:import-roster [file.csv]           # same roster load; defaults to db/sample-roster.csv
+```
+Both modes purge the per-year tables first, are re-runnable, and print login
+details: parents `fam1`..`famN` (password `parentpass`); admin `admin` /
+`admin12345` (override with `SEED_ADMIN_PASSWORD`). `db/sample-roster.csv` is a
+no-PII sample in the real import format — you can also upload it in the admin
+**Start New Year** page.
 
 ## Tests
 

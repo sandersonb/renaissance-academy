@@ -1,11 +1,11 @@
 import { useState } from 'react';
-import { Link } from 'react-router-dom';
 import { adminApi, ApiError } from '../api';
 import { ErrorBanner } from '../components/Layout';
 
 type Validation = { ok: boolean; rowCount: number; errors: { line: number; message: string }[]; byGrade: Record<number, number> };
 
-export function AdminRollYear() {
+/** Start-new-year section: purge the prior year and import the current-student roster. */
+export function RollYearPanel() {
   const [year, setYear] = useState(new Date().getFullYear());
   const [csv, setCsv] = useState('');
   const [fileName, setFileName] = useState('');
@@ -38,9 +38,8 @@ export function AdminRollYear() {
   };
 
   return (
-    <div>
-      <h1>Admin · Start New Lottery Year</h1>
-      <p className="muted"><Link to="/admin">← search</Link></p>
+    <section>
+      <h2 className="section">Start a new lottery year</h2>
       <div className="error">
         ⚠️ This wipes all applicants, parents, and answers for the prior year and imports
         the new current-student roster. <b>Back up the database first.</b>
@@ -58,7 +57,7 @@ export function AdminRollYear() {
 
       {valid && !done && (
         <div className="card">
-          <h2>Validation</h2>
+          <h3>Validation</h3>
           <p className="muted">{valid.rowCount} students · by grade {JSON.stringify(valid.byGrade)}</p>
           {valid.errors.length > 0 && (
             <div className="error">
@@ -74,10 +73,10 @@ export function AdminRollYear() {
 
       {done && (
         <div className="card center">
-          <h2>New year started ✓</h2>
-          <p className="muted">Imported {done.imported} current students. Restart the API to apply the new year settings.</p>
+          <h3>New year started ✓</h3>
+          <p className="muted">Imported {done.imported} current students. The new year and gates are now in effect.</p>
         </div>
       )}
-    </div>
+    </section>
   );
 }

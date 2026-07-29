@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { adminApi, ApiError, type AdminChild } from '../api';
 import { ErrorBanner } from '../components/Layout';
+import { AdminNav } from './AdminNav';
 
 const gradeLabel = (g: number) => (g === 0 ? 'K' : String(g));
 
@@ -25,7 +26,7 @@ export function AdminSearch() {
   return (
     <div>
       <h1>Admin · Search</h1>
-      <p className="muted"><Link to="/admin/lottery">Run Lottery →</Link> · <Link to="/admin/roll-year">Start New Year →</Link> · <Link to="/admin/survey">Survey Questions →</Link> · <Link to="/admin/notify">Notifications →</Link></p>
+      <AdminNav />
       <ErrorBanner message={error} />
       <form onSubmit={submit} className="card">
         <label>Find a student by name</label>

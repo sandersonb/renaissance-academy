@@ -157,17 +157,20 @@ export class AuthService {
   /** login2.pl: verify password (bcrypt, else legacy crypt + upgrade), issue session. */
   async login(username: string, password: string): Promise<SessionRecord> {
     const user = await this.users.findByUsername(username);
-    if (!user) throw new AuthError('User does not exist.');
 
     let ok = false;
-    if (user.pwHash) {
-      ok = await this.pw.verifyBcrypt(password, user.pwHash);
-    } else if (this.pw.verifyLegacyCrypt(password, user.encpass)) {
-      ok = true;
-      // Upgrade-on-login: store a bcrypt hash for next time.
-      await this.users.setPasswordHash(user.id, await this.pw.hashBcrypt(password), PW_ALGO);
+    if (user) {
+      if (user.pwHash) {
+        ok = await this.pw.verifyBcrypt(password, user.pwHash);
+      } else if (this.pw.verifyLegacyCrypt(password, user.encpass)) {
+        ok = true;
+        // Upgrade-on-login: store a bcrypt hash for next time.
+        await this.users.setPasswordHash(user.id, await this.pw.hashBcrypt(password), PW_ALGO);
+      }
     }
-    if (!ok) throw new AuthError('You entered the wrong password.');
+    // Same message whether the username is unknown or the password is wrong, so
+    // we never reveal which usernames exist (no account enumeration).
+    if (!user || !ok) throw new AuthError('Invalid username or password.');
 
     if (user.status !== 'CONFIRMED') {
       throw new AuthError('This username has not been validated. Please check your email.');

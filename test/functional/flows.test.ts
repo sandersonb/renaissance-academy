@@ -20,7 +20,7 @@ const HAS_DOCKER = dockerAvailable();
 const config: AppConfig = {
   yearBegin: 2026, lotteryOpen: true, postLottery: false,
   offerExpirationDays: 3, paperworkExpirationDays: 5, bcryptCost: 4, dualWriteLegacyCrypt: true,
-  appBaseUrl: 'http://test', childEditableFields: [], adminIpAllowlist: [], trustProxy: false,
+  appBaseUrl: 'http://test', childEditableFields: [], adminIpAllowlist: [], trustProxy: false, emailBatchSize: 20, emailSendSpacingMs: 0, emailDailyCap: 400,
 };
 
 const json = (payload: unknown, cookie?: string) => ({
@@ -153,12 +153,17 @@ describe.skipIf(!HAS_DOCKER)('functional (real MySQL)', () => {
     const [runs0] = await pool.query<any[]>('SELECT COUNT(*) AS n FROM lottery_run');
     expect(Number(runs0[0].n)).toBe(0);
 
-    const commit = await app.inject({ method: 'POST', url: '/api/admin/lottery/commit', ...json({ caps, seed: preview.json().seed }, cookie) });
-    expect(commit.json().totals).toEqual(preview.json().totals); // reproducible
+    // The live run takes NO seed and draws its own — a preview is never reused.
+    const commit = await app.inject({ method: 'POST', url: '/api/admin/lottery/commit', ...json({ caps }, cookie) });
+    expect(commit.json().seed).toBeTruthy();
+    expect(commit.json().seed).not.toBe(preview.json().seed); // independent draw
+    // Counts are cap-bound regardless of seed: 3 offered, all 8 placed + logged.
     const [offered] = await pool.query<any[]>("SELECT COUNT(*) AS n FROM Child WHERE Grade_nxt_yr='0' AND Reg_Status='PEND_OFFER'");
     expect(Number(offered[0].n)).toBe(3);
     const [assignments] = await pool.query<any[]>('SELECT COUNT(*) AS n FROM lottery_assignment');
     expect(Number(assignments[0].n)).toBe(8);
+    const [seedRow] = await pool.query<any[]>('SELECT seed FROM lottery_run LIMIT 1');
+    expect(String(seedRow[0].seed)).toBe(commit.json().seed); // persisted draw seed
   });
 
   it('admin: roll new year purges prior data and imports the roster', async () => {
@@ -202,6 +207,113 @@ describe.skipIf(!HAS_DOCKER)('functional (real MySQL)', () => {
     expect(q.options.map((o: any) => o.value)).toContain('Yes');
     const [row] = await pool.query<any[]>('SELECT input_type FROM ExtraTitles WHERE Title_ID=?', [titleId]);
     expect(row[0].input_type).toBe('single_select');
+  });
+
+  it('admin: reports merges child + parent answers across mismatched collations', async () => {
+    // Extra.Value (utf8_unicode_ci) and ParentExtra.Answer (utf8_general_ci) have
+    // different collations, so combining them in a single UNION column throws
+    // "Illegal mix of collations". This asserts the reports endpoint (two queries
+    // merged in JS) handles both answer sources against the real schema.
+    await new AdminAuthService(repos.admins, repos.adminSessions, config).createAdmin('boss', 'adminpass123');
+    const login = await app.inject({ method: 'POST', url: '/api/admin/login', ...json({ username: 'boss', password: 'adminpass123' }) });
+    const cookie = `asid=${login.cookies.find((c) => c.name === 'asid')!.value}`;
+
+    // A registration question + option (child answer) and a lottery question (parent answer).
+    const [t] = await pool.query<ResultSetHeader>(
+      "INSERT INTO ExtraTitles (Question, Lottery_question, Brief, input_type, active, sort_order) VALUES ('Session?',0,'K Session','single_select',1,10)",
+    );
+    const regTitleId = t.insertId;
+    const [e] = await pool.query<ResultSetHeader>('INSERT INTO Extra (Title_ID, Value) VALUES (?, ?)', [regTitleId, 'AM']);
+    const extraId = e.insertId;
+    const [lt] = await pool.query<ResultSetHeader>(
+      "INSERT INTO ExtraTitles (Question, Lottery_question, Brief, input_type, active, sort_order) VALUES ('Why apply?',1,'pushmarket','text',1,20)",
+    );
+    const lotteryTitleId = lt.insertId;
+
+    const parentId = await insertParent('rep@example.com');
+    const childId = await insertChild(parentId, 3, 'REGISTER', 'Reba');
+    await pool.query('INSERT INTO ChildExtra (Child_ID, Extra_ID) VALUES (?, ?)', [childId, extraId]);
+    await pool.query('INSERT INTO ParentExtra (Parent_ID, Title_ID, Answer) VALUES (?, ?, ?)', [parentId, lotteryTitleId, 'Small class sizes']);
+
+    const res = await app.inject({ method: 'GET', url: '/api/admin/reports', headers: { cookie } });
+    expect(res.statusCode).toBe(200); // would be 500 with the old UNION query
+    const body = res.json();
+    // Child registration answer (has a grade) and parent lottery answer (no grade) both present.
+    expect(body.responses.some((r: any) => r.parentId === parentId && r.value === 'AM' && r.grade === 3)).toBe(true);
+    expect(body.responses.some((r: any) => r.value === 'Small class sizes' && r.grade === null)).toBe(true);
+    // Tallied.
+    expect(body.counts.some((c: any) => c.titleId === regTitleId && c.value === 'AM' && c.count === 1)).toBe(true);
+  });
+
+  it('admin: caps edit, admin management, lottery history, and email log', async () => {
+    await new AdminAuthService(repos.admins, repos.adminSessions, config).createAdmin('boss', 'adminpass123');
+    const login = await app.inject({ method: 'POST', url: '/api/admin/login', ...json({ username: 'boss', password: 'adminpass123' }) });
+    const cookie = `asid=${login.cookies.find((c) => c.name === 'asid')!.value}`;
+
+    // Caps: PUT persists to MaxEnrollment (UPSERT), GET reflects it.
+    const put = await app.inject({ method: 'PUT', url: '/api/admin/caps', ...json({ caps: [5, 0, 0, 0, 0, 0, 0, 0, 0, 0] }, cookie) });
+    expect(put.json().caps[0]).toBe(5);
+    const [capRow] = await pool.query<any[]>("SELECT Num_Students FROM MaxEnrollment WHERE Grade='0'");
+    expect(Number(capRow[0].Num_Students)).toBe(5);
+
+    // Admin management: create, list, deactivate.
+    expect((await app.inject({ method: 'POST', url: '/api/admin/admins', ...json({ username: 'alice', password: 'longpassword' }, cookie) })).statusCode).toBe(200);
+    const admins = (await app.inject({ method: 'GET', url: '/api/admin/admins', headers: { cookie } })).json().admins;
+    const alice = admins.find((a: any) => a.username === 'alice');
+    expect(alice).toBeTruthy();
+    expect((await app.inject({ method: 'PATCH', url: `/api/admin/admins/${alice.id}`, ...json({ active: false }, cookie) })).statusCode).toBe(200);
+
+    // Lottery history: commit a small draw, then read it back with counts.
+    for (let i = 0; i < 8; i++) { const p = await insertParent(`h${i}@example.com`); await insertChild(p, 0, 'INITIAL', `K${i}`); }
+    await app.inject({ method: 'POST', url: '/api/admin/lottery/commit', ...json({ caps: [5, 0, 0, 0, 0, 0, 0, 0, 0, 0] }, cookie) });
+    const runs = (await app.inject({ method: 'GET', url: '/api/admin/lottery/runs', headers: { cookie } })).json().runs;
+    expect(runs[0]).toMatchObject({ offered: 5, waitlisted: 3, committed: true });
+    expect(runs[0].seed).toBeTruthy();
+
+    // Email log: a queued row shows up newest-first.
+    await pool.query("INSERT INTO email_outbox (recipient, template, payload, created_at) VALUES ('log@example.com','offer','{}',NOW())");
+    const log = (await app.inject({ method: 'GET', url: '/api/admin/notify/log', headers: { cookie } })).json().messages;
+    expect(log.some((m: any) => m.recipient === 'log@example.com')).toBe(true);
+  });
+
+  it('paperwork: admin uploads a PDF; entitled parent downloads it, others are denied', async () => {
+    const pdf = Buffer.from('%PDF-1.4\nrenaissance test packet\n%%EOF');
+    await new AdminAuthService(repos.admins, repos.adminSessions, config).createAdmin('boss', 'adminpass123');
+    const adminLogin = await app.inject({ method: 'POST', url: '/api/admin/login', ...json({ username: 'boss', password: 'adminpass123' }) });
+    const adminCookie = `asid=${adminLogin.cookies.find((c) => c.name === 'asid')!.value}`;
+
+    // Admin uploads two packets (raw PDF body → stored as LONGBLOB).
+    for (const slug of ['family', 'grade_3']) {
+      const up = await app.inject({
+        method: 'POST', url: `/api/admin/documents/${slug}?filename=${slug}.pdf`,
+        headers: { 'content-type': 'application/pdf', cookie: adminCookie }, payload: pdf,
+      });
+      expect(up.statusCode).toBe(200);
+    }
+    const adminList = (await app.inject({ method: 'GET', url: '/api/admin/documents', headers: { cookie: adminCookie } })).json().documents;
+    expect(adminList.find((d: any) => d.slug === 'family')).toMatchObject({ available: true, size: pdf.length });
+    // Reject a non-PDF.
+    const bad = await app.inject({ method: 'POST', url: '/api/admin/documents/family?filename=x.pdf', headers: { 'content-type': 'application/pdf', cookie: adminCookie }, payload: Buffer.from('nope') });
+    expect(bad.statusCode).toBe(400);
+
+    // A returning parent with a newly-admitted (PEND_REGISTER, grade 3) child.
+    const reg = await app.inject({ method: 'POST', url: '/api/auth/register',
+      ...json({ username: 'docp', password: 'secret1', firstName: 'Doc', lastName: 'Parent', state: 'UT', zip: '84043', email: 'docp@example.com', homePhone: '8015551234', returning: true }) });
+    await app.inject({ method: 'POST', url: '/api/auth/confirm', ...json({ token: reg.json().confirmToken }) });
+    const pLogin = await app.inject({ method: 'POST', url: '/api/auth/login', ...json({ username: 'docp', password: 'secret1' }) });
+    const pCookie = `sid=${pLogin.cookies.find((c) => c.name === 'sid')!.value}`;
+    const parentId = (await app.inject({ method: 'GET', url: '/api/me', headers: { cookie: pCookie } })).json().parentId;
+    await insertChild(parentId, 3, 'PEND_REGISTER');
+
+    // Parent sees family + grade_3 (both uploaded) and can download grade_3.
+    const mine = (await app.inject({ method: 'GET', url: '/api/me/documents', headers: { cookie: pCookie } })).json().documents;
+    expect(mine.map((d: any) => d.slug).sort()).toEqual(['family', 'grade_3']);
+    const dl = await app.inject({ method: 'GET', url: '/api/documents/grade_3', headers: { cookie: pCookie } });
+    expect(dl.statusCode).toBe(200);
+    expect(dl.headers['content-type']).toContain('application/pdf');
+    expect(dl.rawPayload.subarray(0, 4).toString()).toBe('%PDF');
+    // Not entitled to a grade they have no child in.
+    expect((await app.inject({ method: 'GET', url: '/api/documents/grade_4', headers: { cookie: pCookie } })).statusCode).toBe(404);
   });
 
   it('email: register enqueues to the outbox; notify offers + worker drains', async () => {

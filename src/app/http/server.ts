@@ -3,6 +3,8 @@
  * a non-IP-pinned httpOnly cookie (deviation S4). Composition is injected so
  * tests can build the server over in-memory repositories.
  */
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { ZodError } from 'zod';
 import { RegStatus, HUMANIFY, gradeLabel } from '../../domain/regStatus.js';
@@ -20,8 +22,9 @@ import { SurveyService } from '../services/surveyService.js';
 import { OfferError, OfferService } from '../services/offerService.js';
 import { AdminAuthError, AdminAuthService } from '../services/adminAuthService.js';
 import { AdminError, AdminService } from '../services/adminService.js';
-import { LotteryService } from '../services/lotteryService.js';
+import { LotteryError, LotteryService } from '../services/lotteryService.js';
 import { RollYearError, RollYearService } from '../services/rollYearService.js';
+import { DocumentError, DocumentService } from '../services/documentService.js';
 import { AdminSurveyError, AdminSurveyService } from '../services/adminSurveyService.js';
 
 declare module 'fastify' {
@@ -50,6 +53,25 @@ function parseCookies(header: string | undefined): Record<string, string> {
   return out;
 }
 
+/** The bundled fallback packet served when a slot has no real upload yet.
+ *  Override the path with DEFAULT_PACKET_PATH; absent file = no fallback (404). */
+function loadDefaultPacket(): Buffer | null {
+  const p = process.env.DEFAULT_PACKET_PATH || join(process.cwd(), 'assets', 'default-packet.pdf');
+  try {
+    return readFileSync(p);
+  } catch {
+    return null;
+  }
+}
+
+/** Stream a stored document (PDF) inline with its original filename. */
+function sendDocument(reply: FastifyReply, f: { contentType: string; filename: string; bytes: Buffer }) {
+  return reply
+    .header('content-type', f.contentType)
+    .header('content-disposition', `inline; filename="${f.filename.replace(/"/g, '')}"`)
+    .send(f.bytes);
+}
+
 /** print_rank (users.pm): WAIT rank counts SIB_WAIT ahead; SIB_WAIT uses Position. */
 function waitlistRank(
   status: RegStatus,
@@ -74,7 +96,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // surface confirmation/reset tokens in API responses + the UI so you can verify
   // without an inbox. With a real (SMTP) provider these are NEVER exposed.
   const emailDev = emailProvider instanceof ConsoleEmailProvider;
-  const emailWorker = new EmailWorker(repos.outbox, emailProvider);
+  const emailWorker = new EmailWorker(repos.outbox, emailProvider, {
+    batchSize: config.emailBatchSize, spacingMs: config.emailSendSpacingMs, dailyCap: config.emailDailyCap,
+  });
   const notify = new NotifyService(db, config);
   const survey = new SurveyService(repos.children, repos.survey);
   const auth = new AuthService(db, config, undefined, survey, mailer);
@@ -83,20 +107,32 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   const adminAuth = new AdminAuthService(repos.admins, repos.adminSessions, config);
   const admin = new AdminService(db, config);
   const lottery = new LotteryService(db, config);
-  const rollYear = new RollYearService(db);
+  const rollYear = new RollYearService(db, config);
   const adminSurvey = new AdminSurveyService(repos.survey);
+  const documents = new DocumentService(repos, config, loadDefaultPacket());
   const app = Fastify({ logger: false, trustProxy: config.trustProxy });
+  // Accept raw PDF uploads (admin paperwork). Body arrives as a Buffer; the
+  // upload route raises its own bodyLimit above the default 1 MB.
+  app.addContentTypeParser('application/pdf', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
 
-  app.setErrorHandler((err, _req, reply) => {
+  app.setErrorHandler((err, req, reply) => {
     if (err instanceof ZodError) {
       return reply.status(400).send({ error: 'validation', issues: err.issues.map((i) => i.message) });
     }
     if (err instanceof AdminAuthError) {
       return reply.status(401).send({ error: err.message });
     }
-    if (err instanceof AuthError || err instanceof EnrollmentError || err instanceof OfferError || err instanceof AdminError || err instanceof RollYearError || err instanceof AdminSurveyError) {
+    if (err instanceof AuthError || err instanceof EnrollmentError || err instanceof OfferError || err instanceof AdminError || err instanceof RollYearError || err instanceof AdminSurveyError || err instanceof LotteryError || err instanceof DocumentError) {
       return reply.status(400).send({ error: err.message });
     }
+    // Pass through framework 4xx (e.g. bad/empty JSON body) with its real status
+    // instead of masking it as a 500.
+    const e = err as { statusCode?: number; message?: string };
+    if (typeof e.statusCode === 'number' && e.statusCode >= 400 && e.statusCode < 500) {
+      return reply.status(e.statusCode).send({ error: e.message ?? 'Request error' });
+    }
+    // Unexpected error — log it (with route context) so it isn't silently swallowed.
+    req.log.error({ err, url: req.url, method: req.method }, 'Unhandled request error');
     reply.status(500).send({ error: 'Internal error' });
   });
 
@@ -244,6 +280,16 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     };
   });
 
+  // Registration paperwork the parent is entitled to (enroll.pl S3 links).
+  app.get('/api/me/documents', { preHandler: requireAuth }, async (req) => ({
+    documents: await documents.parentDocuments(req.userId!),
+  }));
+  app.get('/api/documents/:slug', { preHandler: requireAuth }, async (req, reply) => {
+    const f = await documents.parentFile(req.userId!, (req.params as { slug: string }).slug);
+    if (!f) return reply.status(404).send({ error: 'That document is not available for your account.' });
+    return sendDocument(reply, f);
+  });
+
   app.post('/api/children', { preHandler: requireAuth }, async (req, reply) => {
     const result = await enrollment.addChild(req.userId!, req.body);
     return reply.status(201).send(result);
@@ -297,9 +343,101 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   app.get('/api/admin/me', { preHandler: requireAdmin }, async (req) => ({ adminId: req.adminId }));
 
+  app.get('/api/admin/summary', { preHandler: requireAdmin }, async () => admin.summary());
+
+  app.get('/api/admin/reports', { preHandler: requireAdmin }, async () => admin.surveyReport());
+
+  app.get('/api/admin/caps', { preHandler: requireAdmin }, async () => ({ caps: await admin.getCaps() }));
+  app.put('/api/admin/caps', { preHandler: requireAdmin }, async (req) => {
+    const { caps } = (req.body ?? {}) as { caps?: unknown };
+    return { caps: await admin.updateCaps(caps) };
+  });
+
+  app.get('/api/admin/admins', { preHandler: requireAdmin }, async () => ({ admins: await admin.listAdmins() }));
+  app.post('/api/admin/admins', { preHandler: requireAdmin }, async (req) => {
+    const { username, password } = (req.body ?? {}) as { username?: string; password?: string };
+    return { id: await admin.createAdminAccount(String(username ?? ''), String(password ?? '')) };
+  });
+  app.patch('/api/admin/admins/:id', { preHandler: requireAdmin }, async (req) => {
+    const { active } = (req.body ?? {}) as { active?: boolean };
+    await admin.setAdminActive(Number((req.params as { id: string }).id), active === true, req.adminId);
+    return { ok: true };
+  });
+
+  app.get('/api/admin/lottery/runs', { preHandler: requireAdmin }, async () => ({ runs: await admin.lotteryHistory(20) }));
+
+  // --- Registration paperwork (admin-managed; replaces public S3 links) ---
+  app.get('/api/admin/documents', { preHandler: requireAdmin }, async () => ({ documents: await documents.adminList() }));
+  app.post('/api/admin/documents/:slug', { preHandler: requireAdmin, bodyLimit: 16 * 1024 * 1024 }, async (req) => {
+    const slug = (req.params as { slug: string }).slug;
+    const filename = String((req.query as { filename?: string }).filename ?? '');
+    const body = req.body;
+    if (!Buffer.isBuffer(body)) throw new DocumentError('Upload the file as a PDF (content-type application/pdf).');
+    await documents.upload(slug, filename, body, req.adminId ?? null);
+    return { ok: true };
+  });
+  app.get('/api/admin/documents/:slug/file', { preHandler: requireAdmin }, async (req, reply) => {
+    const f = await documents.adminFile((req.params as { slug: string }).slug);
+    if (!f) return reply.status(404).send({ error: 'Not uploaded' });
+    return sendDocument(reply, f);
+  });
+  app.delete('/api/admin/documents/:slug', { preHandler: requireAdmin }, async (req) => {
+    await documents.remove((req.params as { slug: string }).slug);
+    return { ok: true };
+  });
+
+  app.get('/api/admin/settings', { preHandler: requireAdmin }, async () => admin.getSettings());
+
+  app.patch('/api/admin/settings', { preHandler: requireAdmin }, async (req) => {
+    const body = (req.body ?? {}) as { lotteryOpen?: unknown; postLottery?: unknown };
+    return admin.updateSettings({
+      lotteryOpen: typeof body.lotteryOpen === 'boolean' ? body.lotteryOpen : undefined,
+      postLottery: typeof body.postLottery === 'boolean' ? body.postLottery : undefined,
+    });
+  });
+
+  app.get('/api/admin/roster', { preHandler: requireAdmin }, async (req) => {
+    const query = req.query as { grade?: string; name?: string };
+    const gradeRaw = query.grade?.trim();
+    let grade: number | null = null;
+    if (gradeRaw != null && gradeRaw !== '') {
+      grade = /^k$/i.test(gradeRaw) ? 0 : Number(gradeRaw);
+      if (!Number.isInteger(grade)) grade = null;
+    }
+    return { roster: await admin.rosterList({ grade, name: query.name?.trim() || null }) };
+  });
+
+  app.post('/api/admin/roster', { preHandler: requireAdmin }, async (req) => {
+    const childId = await admin.rosterCreate((req.body ?? {}) as Record<string, never>);
+    return { childId };
+  });
+
+  app.patch('/api/admin/roster/:id', { preHandler: requireAdmin }, async (req) => {
+    await admin.rosterUpdate(Number((req.params as { id: string }).id), (req.body ?? {}) as Record<string, never>);
+    return { ok: true };
+  });
+
+  app.delete('/api/admin/roster/:id', { preHandler: requireAdmin }, async (req) => {
+    await admin.rosterDelete(Number((req.params as { id: string }).id));
+    return { ok: true };
+  });
+
   app.get('/api/admin/search', { preHandler: requireAdmin }, async (req) => {
     const q = (req.query as { q?: string }).q ?? '';
     return { results: await admin.search(q) };
+  });
+
+  app.get('/api/admin/list', { preHandler: requireAdmin }, async (req) => {
+    const q = req.query as { grade?: string; status?: string; name?: string };
+    const gradeRaw = q.grade?.trim();
+    let grade: number | null = null;
+    if (gradeRaw != null && gradeRaw !== '') {
+      grade = /^k$/i.test(gradeRaw) ? 0 : Number(gradeRaw);
+      if (!Number.isInteger(grade) || grade < 0 || grade > 9) grade = null;
+    }
+    const status =
+      q.status && (Object.values(RegStatus) as string[]).includes(q.status) ? (q.status as RegStatus) : null;
+    return admin.list({ grade, status, name: q.name?.trim() || null });
   });
 
   app.get('/api/admin/family/:parentId', { preHandler: requireAdmin }, async (req) =>
@@ -309,6 +447,31 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   app.post('/api/admin/children/:id/status', { preHandler: requireAdmin }, async (req) => {
     const { status } = (req.body ?? {}) as { status?: string };
     return admin.changeStatus(childId(req), status as RegStatus);
+  });
+
+  app.post('/api/admin/children/:id/force-status', { preHandler: requireAdmin }, async (req) => {
+    const { status } = (req.body ?? {}) as { status?: string };
+    return admin.forceStatus(childId(req), status as RegStatus);
+  });
+
+  app.patch('/api/admin/family/:parentId', { preHandler: requireAdmin }, async (req) => {
+    await admin.updateParent(Number((req.params as { parentId: string }).parentId), (req.body ?? {}) as Record<string, never>);
+    return { ok: true };
+  });
+
+  app.post('/api/admin/family/:parentId/children', { preHandler: requireAdmin }, async (req) => {
+    const id = await admin.addChildToFamily(Number((req.params as { parentId: string }).parentId), (req.body ?? {}) as never);
+    return { childId: id };
+  });
+
+  app.patch('/api/admin/children/:id', { preHandler: requireAdmin }, async (req) => {
+    await admin.updateChild(childId(req), (req.body ?? {}) as Record<string, never>);
+    return { ok: true };
+  });
+
+  app.delete('/api/admin/children/:id', { preHandler: requireAdmin }, async (req) => {
+    await admin.deleteChild(childId(req));
+    return { ok: true };
   });
 
   app.post('/api/admin/family/:parentId/note', { preHandler: requireAdmin }, async (req) => {
@@ -328,8 +491,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   app.post('/api/admin/lottery/commit', { preHandler: requireAdmin }, async (req) => {
-    const { caps, seed } = (req.body ?? {}) as { caps?: number[]; seed?: string };
-    return lottery.commit(caps, seed);
+    // No client-supplied seed: the live draw is generated fresh server-side so a
+    // preview can never be reused as the official outcome.
+    const { caps } = (req.body ?? {}) as { caps?: number[] };
+    return lottery.commit(caps);
   });
 
   app.post('/api/admin/roll-year/validate', { preHandler: requireAdmin }, async (req) => {
@@ -378,7 +543,15 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // Notify (replaces the two notify crons) + outbox visibility/flush.
   app.post('/api/admin/notify/offers', { preHandler: requireAdmin }, async () => notify.materializeOffers());
   app.post('/api/admin/notify/reminders', { preHandler: requireAdmin }, async () => notify.sendReminders());
-  app.get('/api/admin/notify/status', { preHandler: requireAdmin }, async () => ({ outbox: await repos.outbox.countByState() }));
+  app.get('/api/admin/notify/status', { preHandler: requireAdmin }, async () => ({
+    outbox: await repos.outbox.countByState(),
+    sentLast24h: await repos.outbox.countSentSince(new Date(Date.now() - 24 * 60 * 60 * 1000)),
+    dailyCap: config.emailDailyCap,
+  }));
+  app.get('/api/admin/notify/log', { preHandler: requireAdmin }, async (req) => {
+    const state = (req.query as { state?: string }).state;
+    return { messages: await admin.emailLog(50, state && state !== 'all' ? state : undefined) };
+  });
   app.post('/api/admin/notify/drain', { preHandler: requireAdmin }, async () => emailWorker.drain());
 
   return app;

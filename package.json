@@ -12,6 +12,10 @@
     "dev": "tsx watch src/app/http/main.ts",
     "start": "tsx src/app/http/main.ts",
     "db:migrate": "tsx src/app/adapters/mysql/migrate.ts",
+    "db:import-roster": "tsx src/app/cli/importRoster.ts",
+    "db:seed": "tsx src/app/cli/seed.ts",
+    "db:seed:pre": "tsx src/app/cli/seed.ts --mode=pre-lottery",
+    "db:seed:post": "tsx src/app/cli/seed.ts --mode=post-lottery",
     "admin:create": "tsx src/app/cli/createAdmin.ts",
     "lottery:demo": "tsx src/domain/lottery/demo.ts"
   },

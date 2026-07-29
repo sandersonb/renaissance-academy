@@ -14,6 +14,8 @@ import type { AppConfig } from '../config.js';
 import type { Database } from '../ports/database.js';
 import type { ChildRecord, Repositories } from '../ports/repositories.js';
 
+export class LotteryError extends Error {}
+
 const toDomain = (c: ChildRecord): Child => ({
   childId: c.childId, parentId: c.parentId, grade: c.gradeNextYear,
   regStatus: c.regStatus, considerations: c.lotteryConsiderations, position: c.position,
@@ -61,17 +63,29 @@ export class LotteryService {
     return { caps, children };
   }
 
-  /** Dry run — no DB writes. Returns the summary + a seed to commit later. */
+  /**
+   * Illustrative dry run — NO DB writes, and the seed it uses is NOT reused by
+   * commit(). Each preview is one random sample of "what might happen"; the
+   * official draw is drawn independently, so a preview must never be presented as
+   * the outcome. (Legal/fairness requirement.)
+   */
   async preview(capsArg?: number[]): Promise<LotterySummary> {
     const { caps, children } = await this.load(capsArg);
     const seed = makeSeed();
     return summarize(seed, caps, children, runLottery(children, caps, seed));
   }
 
-  /** Apply the draw: record the immutable log, then place each student. */
-  async commit(capsArg?: number[], seedArg?: string): Promise<LotterySummary & { runId: number }> {
+  /** Apply the official draw: record the immutable log, then place each student. */
+  async commit(capsArg?: number[]): Promise<LotterySummary & { runId: number }> {
+    // Guard: the draw runs once per cycle. post_lottery=1 means it already ran;
+    // re-running would re-place students and disrupt existing offers/waitlists.
+    if (this.config.postLottery) {
+      throw new LotteryError('The lottery has already been run for this year. To re-run it, first turn off the "Post-lottery" gate in Settings.');
+    }
     const { caps, children } = await this.load(capsArg);
-    const seed = seedArg ?? makeSeed();
+    // ALWAYS a fresh, server-generated seed — a previewed draw is never reused.
+    // The live lottery is an independent random draw nobody has seen.
+    const seed = makeSeed();
     const result = runLottery(children, caps, seed);
 
     // Record the draw log AND apply every placement atomically (B2/B3).
@@ -84,8 +98,11 @@ export class LotteryService {
         })),
       );
       for (const a of result.assignments) await tx.children.updateStatus(a.childId, a.to, a.position);
+      // Committing a draw moves the cycle into its post-lottery phase.
+      await tx.settings.set({ yearBegin: this.config.yearBegin, lotteryOpen: this.config.lotteryOpen, postLottery: true });
       return id;
     });
+    this.config.postLottery = true; // apply live (shared config object)
 
     return { runId, ...summarize(seed, caps, children, result) };
   }

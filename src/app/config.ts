@@ -26,6 +26,12 @@ export interface AppConfig {
   adminIpAllowlist: string[];
   /** Trust X-Forwarded-* so request.ip is the real client behind nginx. */
   trustProxy: boolean;
+  /** Email send throttle (Gmail has strict daily + burst limits). The worker
+   *  sends at most `emailBatchSize` per drain, waits `emailSendSpacingMs`
+   *  between messages, and never exceeds `emailDailyCap` in a rolling 24h. */
+  emailBatchSize: number;
+  emailSendSpacingMs: number;
+  emailDailyCap: number;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -43,5 +49,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     childEditableFields: (env.CHILD_EDITABLE_FIELDS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
     adminIpAllowlist: (env.ADMIN_IP_ALLOWLIST ?? '').split(',').map((s) => s.trim()).filter(Boolean),
     trustProxy: bool(env.TRUST_PROXY, false),
+    // Defaults tuned for consumer Gmail (~500 msgs/day): 20 per drain, ~1.5s
+    // apart, 400/day ceiling. Raise EMAIL_DAILY_CAP for Google Workspace.
+    emailBatchSize: num(env.EMAIL_BATCH_SIZE, 20),
+    emailSendSpacingMs: num(env.EMAIL_SEND_SPACING_MS, 1500),
+    emailDailyCap: num(env.EMAIL_DAILY_CAP, 400),
   };
 }

@@ -11,7 +11,7 @@ import { NotifyService } from '../src/app/services/notifyService.js';
 const config: AppConfig = {
   yearBegin: 2026, lotteryOpen: true, postLottery: false,
   offerExpirationDays: 3, paperworkExpirationDays: 5, bcryptCost: 4, dualWriteLegacyCrypt: true,
-  appBaseUrl: 'http://test', childEditableFields: [], adminIpAllowlist: [], trustProxy: false,
+  appBaseUrl: 'http://test', childEditableFields: [], adminIpAllowlist: [], trustProxy: false, emailBatchSize: 20, emailSendSpacingMs: 0, emailDailyCap: 400,
 };
 
 class CapturingProvider implements EmailProvider {
@@ -20,6 +20,13 @@ class CapturingProvider implements EmailProvider {
 }
 class FailingProvider implements EmailProvider {
   async send() { throw new Error('smtp down'); }
+}
+class ThrottledProvider implements EmailProvider {
+  async send(): Promise<void> {
+    const e = new Error('4.7.0 Try again later') as Error & { responseCode: number };
+    e.responseCode = 421; // Gmail rate-limit style transient error
+    throw e;
+  }
 }
 
 let nid = 1;
@@ -55,7 +62,7 @@ describe('OutboxMailer + EmailWorker', () => {
     await repos.outbox.enqueue('a@example.com', 'confirmation', { link: 'http://x' });
     const provider = new CapturingProvider();
     const r = await new EmailWorker(repos.outbox, provider).drain();
-    expect(r).toEqual({ sent: 1, failed: 0 });
+    expect(r).toEqual({ sent: 1, failed: 0, deferred: 0 });
     expect(provider.sent[0]!.subject).toMatch(/confirm/i);
     expect(await repos.outbox.countByState()).toEqual({ sent: 1 });
   });
@@ -66,6 +73,25 @@ describe('OutboxMailer + EmailWorker', () => {
     const worker = new EmailWorker(repos.outbox, new FailingProvider());
     for (let i = 0; i < 6; i++) await worker.drain(); // MAX_ATTEMPTS = 5
     expect(await repos.outbox.countByState()).toEqual({ failed: 1 });
+  });
+
+  it('never exceeds the rolling daily cap across drains', async () => {
+    const db = createMemoryDatabase(); const repos = db.repos;
+    for (let i = 0; i < 5; i++) await repos.outbox.enqueue(`u${i}@x.com`, 'reminder', { link: 'x' });
+    const worker = new EmailWorker(repos.outbox, new CapturingProvider(), { batchSize: 10, spacingMs: 0, dailyCap: 3 });
+    expect((await worker.drain()).sent).toBe(3); // capped this run
+    expect((await worker.drain()).sent).toBe(0); // cap already used in trailing 24h
+    expect((await repos.outbox.countByState()).pending).toBe(2); // remainder still queued
+  });
+
+  it('defers on a provider throttle without burning attempts (retryable later)', async () => {
+    const db = createMemoryDatabase(); const repos = db.repos;
+    await repos.outbox.enqueue('a@x.com', 'reminder', { link: 'x' });
+    await repos.outbox.enqueue('b@x.com', 'reminder', { link: 'x' });
+    const worker = new EmailWorker(repos.outbox, new ThrottledProvider(), { batchSize: 10, spacingMs: 0, dailyCap: 100 });
+    const r = await worker.drain();
+    expect(r).toEqual({ sent: 0, failed: 0, deferred: 2 }); // backed off, nothing dropped
+    expect(await repos.outbox.countByState()).toEqual({ pending: 2 }); // still pending, attempts untouched
   });
 });
 
@@ -95,6 +121,16 @@ describe('NotifyService', () => {
     seedChild(db.store, 2, RegStatus.INITIAL); // not an open item -> no email
 
     const r = await new NotifyService(db, config).sendReminders();
-    expect(r).toEqual({ emails: 1 });
+    expect(r).toEqual({ emails: 1, skipped: 0 });
+  });
+
+  it('sendReminders skips a parent who already has a pending reminder (no duplicates)', async () => {
+    const db = createMemoryDatabase(); const repos = db.repos;
+    seedParent(db.store, 1, 'p1@example.com');
+    seedChild(db.store, 1, RegStatus.OFFER);
+    const notify = new NotifyService(db, config);
+    expect(await notify.sendReminders()).toEqual({ emails: 1, skipped: 0 });
+    expect(await notify.sendReminders()).toEqual({ emails: 0, skipped: 1 }); // already queued
+    expect((await repos.outbox.countByState()).pending).toBe(1); // not re-enqueued
   });
 });

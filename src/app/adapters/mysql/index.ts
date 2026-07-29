@@ -16,7 +16,8 @@ type Queryable = Pick<Pool, 'query'>;
 import type {
   AdminRepo, AdminUserRecord, AppSettings, CapacityRepo,
   ChildRecord, ChildRepo, CurrentStudentImportRow, CurrentStudentRecord, CurrentStudentRepo,
-  ExtraOptionRecord, ExtraTitleRecord, LotteryAssignmentRow, LotteryRunRepo, MaintenanceRepo,
+  DocumentMeta, DocumentRepo,
+  EditableParentFields, ExtraOptionRecord, ExtraTitleRecord, LotteryAssignmentRow, LotteryRunRepo, MaintenanceRepo,
   NoteRecord, NoteRepo, OutboxEmail, OutboxRepo, ParentRecord, ParentRepo,
   Repositories, SessionRecord, SessionRepo, SettingsRepo, SurveyInputType, SurveyRepo,
   UserRecord, UserRepo,
@@ -116,6 +117,23 @@ class SqlParentRepo implements ParentRepo {
       [i.parentId, i.lastName, i.firstName, i.relationship, i.address, i.city, i.state, i.zip,
         i.homePhone, i.otherPhone, i.returning ? 1 : 0, i.email, i.alternateEmail, i.guid, i.confirmToken, i.confirmExpires]);
   }
+  async update(id: number, fields: EditableParentFields) {
+    const col: Record<string, string> = {
+      firstName: 'First_Name', lastName: 'Last_Name', relationship: 'Relationship', address: 'Address',
+      city: 'City', state: 'State', zip: 'Zip', homePhone: 'Home_Phone', otherPhone: 'Other_Phone',
+      email: 'Email', alternateEmail: 'Alternate_Email',
+    };
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    for (const [k, v] of Object.entries(fields)) {
+      if (!col[k]) continue;
+      sets.push(`${col[k]}=?`);
+      params.push(v);
+    }
+    if (sets.length === 0) return;
+    params.push(id);
+    await exec(this.p, `UPDATE Parent SET ${sets.join(', ')} WHERE Parent_ID=?`, params);
+  }
   async findById(id: number) { return first(await q(this.p, 'SELECT * FROM Parent WHERE Parent_ID=?', [id]), toParent); }
   async findByEmail(email: string) { return first(await q(this.p, 'SELECT * FROM Parent WHERE Email=?', [email]), toParent); }
   async findByEmailAndName(email: string, fn: string, ln: string) {
@@ -169,9 +187,9 @@ class SqlChildRepo implements ChildRepo {
   async setPosition(id: number, position: number | null) { await exec(this.p, 'UPDATE Child SET Position=? WHERE Child_ID=?', [position, id]); }
   async setExpiration(id: number, d: string | null) { await exec(this.p, 'UPDATE Child SET Expiration=? WHERE Child_ID=?', [d, id]); }
   async setLanguagePreference(id: number, pref: string | null) { await exec(this.p, 'UPDATE Child SET Language_Preference=? WHERE Child_ID=?', [pref, id]); }
-  async updateFields(id: number, fields: Partial<Pick<ChildRecord, 'firstName' | 'middleName' | 'lastName' | 'gender' | 'gradeNextYear'>>) {
+  async updateFields(id: number, fields: Partial<Pick<ChildRecord, 'firstName' | 'middleName' | 'lastName' | 'gender' | 'gradeNextYear' | 'dob'>>) {
     const col: Record<string, string> = {
-      firstName: 'First_Name', middleName: 'Middle_Name', lastName: 'Last_Name', gender: 'Gender', gradeNextYear: 'Grade_nxt_yr',
+      firstName: 'First_Name', middleName: 'Middle_Name', lastName: 'Last_Name', gender: 'Gender', gradeNextYear: 'Grade_nxt_yr', dob: 'DOB',
     };
     const sets: string[] = [];
     const params: unknown[] = [];
@@ -193,6 +211,31 @@ class SqlCurrentStudentRepo implements CurrentStudentRepo {
     return first(await q(this.p, 'SELECT * FROM Current_Student WHERE First_Name=? AND Last_Name=? AND DOB=? LIMIT 1', [fn, ln, dob]), toCurrent);
   }
   async setStatus(childId: number, s: RegStatus) { await exec(this.p, 'UPDATE Current_Student SET Reg_Status=? WHERE Child_ID=?', [s, childId]); }
+  async all() { return (await q(this.p, 'SELECT * FROM Current_Student ORDER BY Grade, Last_Name, First_Name')).map(toCurrent); }
+  async findById(childId: number) { return first(await q(this.p, 'SELECT * FROM Current_Student WHERE Child_ID=?', [childId]), toCurrent); }
+  async create(i: Omit<CurrentStudentRecord, 'childId'>) {
+    const r = await exec(this.p,
+      'INSERT INTO Current_Student (Last_Name, First_Name, Middle_Name, Gender, DOB, Reg_Status, Grade) VALUES (?,?,?,?,?,?,?)',
+      [i.lastName, i.firstName, i.middleName, i.gender, i.dob, i.regStatus, i.grade]);
+    return r.insertId;
+  }
+  async update(childId: number, fields: Partial<Omit<CurrentStudentRecord, 'childId'>>) {
+    const col: Record<string, string> = {
+      lastName: 'Last_Name', firstName: 'First_Name', middleName: 'Middle_Name',
+      gender: 'Gender', dob: 'DOB', regStatus: 'Reg_Status', grade: 'Grade',
+    };
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    for (const [k, v] of Object.entries(fields)) {
+      if (!col[k]) continue;
+      sets.push(`${col[k]}=?`);
+      params.push(v);
+    }
+    if (sets.length === 0) return;
+    params.push(childId);
+    await exec(this.p, `UPDATE Current_Student SET ${sets.join(', ')} WHERE Child_ID=?`, params);
+  }
+  async delete(childId: number) { await exec(this.p, 'DELETE FROM Current_Student WHERE Child_ID=?', [childId]); }
 }
 
 class SqlSessionRepo implements SessionRepo {
@@ -244,6 +287,13 @@ class SqlCapacityRepo implements CapacityRepo {
     }
     return caps;
   }
+  async setCaps(caps: number[]) {
+    for (let g = 0; g < 10; g++) {
+      await exec(this.p,
+        'INSERT INTO MaxEnrollment (Grade, Num_Students) VALUES (?,?) ON DUPLICATE KEY UPDATE Num_Students=VALUES(Num_Students)',
+        [String(g), Math.max(0, Math.trunc(caps[g] ?? 0))]);
+    }
+  }
 }
 
 class SqlSurveyRepo implements SurveyRepo {
@@ -255,6 +305,40 @@ class SqlSurveyRepo implements SurveyRepo {
   async childAnsweredTitleIds(childId: number) {
     const rows = await q(this.p, 'SELECT DISTINCT E.Title_ID AS t FROM ChildExtra CE JOIN Extra E ON CE.Extra_ID=E.Extra_ID WHERE CE.Child_ID=?', [childId]);
     return new Set(rows.map((r) => Number(r.t)));
+  }
+  async childAnswers(childId: number) {
+    const rows = await q(this.p,
+      `SELECT ET.Title_ID AS titleId, ET.Question AS question, ET.Brief AS brief, E.Value AS value
+         FROM ChildExtra CE JOIN Extra E ON CE.Extra_ID=E.Extra_ID JOIN ExtraTitles ET ON E.Title_ID=ET.Title_ID
+        WHERE CE.Child_ID=? ORDER BY ET.sort_order`, [childId]);
+    return rows.map((r) => ({
+      titleId: Number(r.titleId), question: String(r.question ?? ''),
+      brief: r.brief == null ? null : String(r.brief), value: r.value == null ? null : String(r.value),
+    }));
+  }
+  async surveyResponses() {
+    // Two separate queries (not a UNION) — Extra.Value and ParentExtra.Answer can carry
+    // different collations, which makes a UNION column throw "Illegal mix of collations".
+    const childRows = await q(this.p,
+      `SELECT ET.Title_ID AS titleId, ET.Question AS question, ET.Brief AS brief, ET.Lottery_question AS lq,
+              E.Value AS val, CONCAT(C.First_Name,' ',C.Last_Name) AS subject, C.Grade_nxt_yr AS grade, C.Parent_ID AS parentId
+         FROM ChildExtra CE JOIN Extra E ON CE.Extra_ID=E.Extra_ID JOIN ExtraTitles ET ON E.Title_ID=ET.Title_ID
+         JOIN Child C ON C.Child_ID=CE.Child_ID
+        WHERE E.Value IS NOT NULL AND C.First_Name IS NOT NULL`);
+    const parentRows = await q(this.p,
+      `SELECT ET.Title_ID AS titleId, ET.Question AS question, ET.Brief AS brief, ET.Lottery_question AS lq,
+              PE.Answer AS val, CONCAT(P.First_Name,' ',P.Last_Name) AS subject, PE.Parent_ID AS parentId
+         FROM ParentExtra PE JOIN ExtraTitles ET ON PE.Title_ID=ET.Title_ID JOIN Parent P ON P.Parent_ID=PE.Parent_ID
+        WHERE PE.Answer IS NOT NULL AND PE.Answer <> ''`);
+    const map = (r: Row, grade: number | null) => ({
+      titleId: Number(r.titleId), question: String(r.question ?? ''), brief: r.brief == null ? null : String(r.brief),
+      lotteryQuestion: Number(r.lq), value: String(r.val ?? ''), subject: String(r.subject ?? ''),
+      grade, parentId: Number(r.parentId),
+    });
+    return [
+      ...childRows.map((r) => map(r, r.grade == null ? null : Number(r.grade))),
+      ...parentRows.map((r) => map(r, null)),
+    ];
   }
   async addChildAnswer(childId: number, extraId: number) { await exec(this.p, 'INSERT INTO ChildExtra (Child_ID, Extra_ID) VALUES (?,?)', [childId, extraId]); }
   async clearChildAnswers(childId: number) { await exec(this.p, 'DELETE FROM ChildExtra WHERE Child_ID=?', [childId]); }
@@ -314,6 +398,28 @@ class SqlLotteryRunRepo implements LotteryRunRepo {
     const values = rows.map(() => '(?,?,?,?,?,?,?)').join(',');
     const params = rows.flatMap((a) => [runId, a.childId, a.fromStatus, a.toStatus, a.position, a.phase, a.viaSibling ? 1 : 0]);
     await exec(this.p, `INSERT INTO lottery_assignment (run_id, child_id, from_status, to_status, position, phase, via_sibling) VALUES ${values}`, params);
+  }
+  async listRuns(limit: number) {
+    const runs = await q(this.p, 'SELECT id, seed, year, ran_at AS ranAt, committed FROM lottery_run ORDER BY id DESC LIMIT ?', [limit]);
+    if (runs.length === 0) return [];
+    const ids = runs.map((r) => Number(r.id));
+    const ph = ids.map(() => '?').join(',');
+    const counts = await q(this.p,
+      `SELECT run_id, to_status, COUNT(*) AS n FROM lottery_assignment WHERE run_id IN (${ph}) GROUP BY run_id, to_status`, ids);
+    const byRun = new Map<number, Record<string, number>>();
+    for (const c of counts) {
+      const m = byRun.get(Number(c.run_id)) ?? {};
+      m[String(c.to_status)] = Number(c.n);
+      byRun.set(Number(c.run_id), m);
+    }
+    return runs.map((r) => {
+      const m = byRun.get(Number(r.id)) ?? {};
+      return {
+        id: Number(r.id), seed: String(r.seed), year: Number(r.year),
+        ranAt: r.ranAt == null ? null : String(r.ranAt), committed: Number(r.committed) === 1,
+        offered: m['PEND_OFFER'] ?? 0, waitlisted: m['WAIT'] ?? 0, sibWait: m['SIB_WAIT'] ?? 0,
+      };
+    });
   }
 }
 
@@ -387,6 +493,57 @@ class SqlOutboxRepo implements OutboxRepo {
     }
     return out;
   }
+  async countSentSince(since: Date) {
+    const rows = await q(this.p, "SELECT COUNT(*) AS n FROM email_outbox WHERE state='sent' AND sent_at >= ?", [since]);
+    return Number(rows[0]?.n ?? 0);
+  }
+  async pendingRecipients(template: string) {
+    const rows = await q(this.p, "SELECT DISTINCT recipient FROM email_outbox WHERE state='pending' AND template=?", [template]);
+    return new Set(rows.map((r) => String(r.recipient)));
+  }
+  async recent(limit: number, state?: string) {
+    const rows = await q(this.p,
+      `SELECT id, recipient, template, state, attempts, last_error AS lastError, created_at AS createdAt, sent_at AS sentAt
+         FROM email_outbox ${state ? 'WHERE state=?' : ''} ORDER BY id DESC LIMIT ?`,
+      state ? [state, limit] : [limit]);
+    return rows.map((r) => ({
+      id: Number(r.id), recipient: String(r.recipient), template: String(r.template), state: String(r.state),
+      attempts: Number(r.attempts), lastError: r.lastError == null ? null : String(r.lastError),
+      createdAt: r.createdAt == null ? null : String(r.createdAt), sentAt: r.sentAt == null ? null : String(r.sentAt),
+    }));
+  }
+}
+
+const toDocMeta = (r: Row): DocumentMeta => ({
+  slug: String(r.slug), filename: String(r.filename), contentType: String(r.content_type),
+  size: Number(r.size), uploadedAt: r.uploaded_at == null ? null : String(r.uploaded_at),
+  uploadedBy: r.uploaded_by == null ? null : Number(r.uploaded_by),
+});
+
+class SqlDocumentRepo implements DocumentRepo {
+  constructor(private p: Queryable) {}
+  async list() {
+    return (await q(this.p, 'SELECT slug, filename, content_type, size, uploaded_at, uploaded_by FROM enrollment_document ORDER BY slug')).map(toDocMeta);
+  }
+  async getMeta(slug: string) {
+    return first(await q(this.p, 'SELECT slug, filename, content_type, size, uploaded_at, uploaded_by FROM enrollment_document WHERE slug=?', [slug]), toDocMeta);
+  }
+  async getFile(slug: string) {
+    const r = first(await q(this.p, 'SELECT * FROM enrollment_document WHERE slug=?', [slug]), (row) => row);
+    if (!r) return null;
+    return { ...toDocMeta(r), bytes: r.bytes as Buffer };
+  }
+  async upsert(input: { slug: string; filename: string; contentType: string; bytes: Buffer; size: number; uploadedBy: number | null }) {
+    await exec(this.p,
+      `INSERT INTO enrollment_document (slug, filename, content_type, bytes, size, uploaded_at, uploaded_by)
+       VALUES (?,?,?,?,?,NOW(),?)
+       ON DUPLICATE KEY UPDATE filename=VALUES(filename), content_type=VALUES(content_type), bytes=VALUES(bytes),
+         size=VALUES(size), uploaded_at=NOW(), uploaded_by=VALUES(uploaded_by)`,
+      [input.slug, input.filename, input.contentType, input.bytes, input.size, input.uploadedBy]);
+  }
+  async delete(slug: string) {
+    await exec(this.p, 'DELETE FROM enrollment_document WHERE slug=?', [slug]);
+  }
 }
 
 export function createMysqlRepositories(pool: Queryable): Repositories {
@@ -405,6 +562,7 @@ export function createMysqlRepositories(pool: Queryable): Repositories {
     settings: new SqlSettingsRepo(pool),
     maintenance: new SqlMaintenanceRepo(pool),
     outbox: new SqlOutboxRepo(pool),
+    documents: new SqlDocumentRepo(pool),
   };
 }
 

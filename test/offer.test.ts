@@ -9,7 +9,7 @@ import { OfferService } from '../src/app/services/offerService.js';
 const config: AppConfig = {
   yearBegin: 2026, lotteryOpen: true, postLottery: false,
   offerExpirationDays: 3, paperworkExpirationDays: 5, bcryptCost: 4, dualWriteLegacyCrypt: true,
-  appBaseUrl: 'http://test', childEditableFields: [], adminIpAllowlist: [], trustProxy: false,
+  appBaseUrl: 'http://test', childEditableFields: [], adminIpAllowlist: [], trustProxy: false, emailBatchSize: 20, emailSendSpacingMs: 0, emailDailyCap: 400,
 };
 
 function setup() {

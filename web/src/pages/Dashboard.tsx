@@ -1,7 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth';
-import { api, ApiError, type ChildView } from '../api';
+import { api, ApiError, type ChildView, type ParentDoc } from '../api';
 import { ErrorBanner } from '../components/Layout';
 
 function actions(c: ChildView): { label: string; kind: 'accept' | 'decline' | 'delete' | 'language' }[] {
@@ -19,6 +19,12 @@ export function Dashboard() {
   const nav = useNavigate();
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
+  const [docs, setDocs] = useState<ParentDoc[]>([]);
+
+  useEffect(() => {
+    if (!me) return;
+    api.documents().then((r) => setDocs(r.documents)).catch(() => setDocs([]));
+  }, [me]);
 
   if (!me) return null;
 
@@ -81,6 +87,27 @@ export function Dashboard() {
         )}
         <Link to="/add-child"><button>Add a student</button></Link>
       </div>
+
+      {docs.length > 0 && (
+        <div className="card">
+          <h2>Registration paperwork</h2>
+          <p className="muted">
+            Download the packet(s) below, complete them, and <b>email or bring the completed forms to the
+            enrollment specialist</b>. Please do not submit them through this site.
+          </p>
+          <ul className="answers">
+            {docs.map((d) => (
+              <li key={d.slug}>
+                {d.available ? (
+                  <a href={`/api/documents/${d.slug}`} target="_blank" rel="noreferrer">{d.label}</a>
+                ) : (
+                  <span className="muted">{d.label} — not yet available</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,14 +1,14 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { RegStatus } from '../src/domain/regStatus.js';
 import type { AppConfig } from '../src/app/config.js';
 import { createMemoryDatabase, MemoryStore } from '../src/app/adapters/memory/index.js';
 import type { ChildRecord } from '../src/app/ports/repositories.js';
-import { LotteryService } from '../src/app/services/lotteryService.js';
+import { LotteryError, LotteryService } from '../src/app/services/lotteryService.js';
 
 const config: AppConfig = {
   yearBegin: 2026, lotteryOpen: true, postLottery: false,
   offerExpirationDays: 3, paperworkExpirationDays: 5, bcryptCost: 4, dualWriteLegacyCrypt: true,
-  appBaseUrl: 'http://test', childEditableFields: [], adminIpAllowlist: [], trustProxy: false,
+  appBaseUrl: 'http://test', childEditableFields: [], adminIpAllowlist: [], trustProxy: false, emailBatchSize: 20, emailSendSpacingMs: 0, emailDailyCap: 400,
 };
 
 let nid = 1;
@@ -32,6 +32,9 @@ function population() {
 const CAPS = [3, 5, 0, 0, 0, 0, 0, 0, 0, 0];
 
 describe('LotteryService', () => {
+  // commit() now mutates the shared config (post_lottery) — reset between tests.
+  beforeEach(() => { config.postLottery = false; config.lotteryOpen = true; });
+
   it('preview does not modify any child and returns a seed + summary', async () => {
     const db = population(); const repos = db.repos;
     const svc = new LotteryService(db, config);
@@ -59,12 +62,36 @@ describe('LotteryService', () => {
     expect(db.store.lotteryAssignments.length).toBe(res.totals.offered + res.totals.waitlisted);
   });
 
-  it('is reproducible: committing a previewed seed yields the previewed allocation', async () => {
-    const db = population(); const repos = db.repos;
+  it('committing a draw moves the cycle into the post-lottery phase (DB + live config)', async () => {
+    const db = population();
+    const cfg = { ...config, postLottery: false }; // own copy so the shared const is untouched
+    const svc = new LotteryService(db, cfg);
+    await svc.commit(CAPS);
+    expect(cfg.postLottery).toBe(true); // live config updated
+    expect((await db.repos.settings.get())?.postLottery).toBe(true); // persisted
+  });
+
+  it('refuses to commit a second draw once post_lottery is set', async () => {
+    const db = population();
+    const cfg = { ...config, postLottery: false };
+    const svc = new LotteryService(db, cfg);
+    await svc.commit(CAPS); // first run flips post_lottery
+    // Preview still works (harmless dry run)…
+    await expect(svc.preview(CAPS)).resolves.toBeTruthy();
+    // …but a second commit is blocked.
+    await expect(svc.commit(CAPS)).rejects.toBeInstanceOf(LotteryError);
+    expect(db.store.lotteryRuns).toHaveLength(1); // no second run recorded
+  });
+
+  it('commits with its own fresh seed (a preview is never reused) and records it', async () => {
+    const db = population();
     const svc = new LotteryService(db, config);
     const preview = await svc.preview(CAPS);
-    const committed = await svc.commit(CAPS, preview.seed);
-    expect(committed.byGrade).toEqual(preview.byGrade);
-    expect(committed.totals).toEqual(preview.totals);
+    const committed = await svc.commit(CAPS); // commit takes no seed argument
+    // The committed draw uses a server-generated seed, not the previewed one.
+    expect(committed.seed).toBeTruthy();
+    expect(committed.seed).not.toBe(preview.seed);
+    // …and that seed is what was persisted to the immutable run log.
+    expect(db.store.lotteryRuns[0]!.seed).toBe(committed.seed);
   });
 });

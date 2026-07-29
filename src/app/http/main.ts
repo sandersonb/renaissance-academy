@@ -10,6 +10,7 @@ import type { Database } from '../ports/database.js';
 import { AdminAuthService } from '../services/adminAuthService.js';
 import { OutboxMailer } from '../services/outboxMailer.js';
 import { EmailWorker } from '../services/emailWorker.js';
+import { NotifyService } from '../services/notifyService.js';
 import { emailProviderFromEnv } from '../adapters/email/providers.js';
 import { buildServer } from './server.js';
 
@@ -17,7 +18,7 @@ const config = loadConfig();
 
 const REQUIRED_ADDITIVE_TABLES = [
   'app_sessions', 'admin_users', 'admin_sessions', 'lottery_run',
-  'lottery_assignment', 'app_settings', 'email_outbox',
+  'lottery_assignment', 'app_settings', 'email_outbox', 'enrollment_document',
 ];
 
 let db: Database;
@@ -77,9 +78,27 @@ await adminAuth
 const emailProvider = emailProviderFromEnv();
 const app = buildServer({ config, db, mailer: new OutboxMailer(repos.outbox), emailProvider });
 
-const worker = new EmailWorker(repos.outbox, emailProvider);
-const stopWorker = worker.start(Number(process.env.EMAIL_WORKER_INTERVAL_MS ?? 15000));
-for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { stopWorker(); process.exit(0); });
+const worker = new EmailWorker(repos.outbox, emailProvider, {
+  batchSize: config.emailBatchSize, spacingMs: config.emailSendSpacingMs, dailyCap: config.emailDailyCap,
+});
+const stopWorker = worker.start(Number(process.env.EMAIL_WORKER_INTERVAL_MS ?? 60000));
+
+// Daily reminder re-enqueue (replaces the notify cron's "resend daily until
+// resolved"). Deduped against pending reminders; the worker paces delivery.
+// Set REMINDER_INTERVAL_MS=0 to disable.
+const reminderMs = Number(process.env.REMINDER_INTERVAL_MS ?? 24 * 60 * 60 * 1000);
+let stopReminders = () => {};
+if (reminderMs > 0) {
+  const notify = new NotifyService(db, config);
+  const t = setInterval(() => {
+    notify.sendReminders()
+      .then((r) => r.emails && console.log(`reminders: queued ${r.emails}, skipped ${r.skipped} already-pending`))
+      .catch((e) => console.error('reminder scheduler:', e));
+  }, reminderMs);
+  t.unref?.();
+  stopReminders = () => clearInterval(t);
+}
+for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { stopReminders(); stopWorker(); process.exit(0); });
 
 const port = Number(process.env.PORT ?? 3001);
 app

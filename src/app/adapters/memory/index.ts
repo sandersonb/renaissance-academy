@@ -22,6 +22,9 @@ import type {
   SettingsRepo,
   CurrentStudentRecord,
   CurrentStudentRepo,
+  DocumentFile,
+  DocumentRepo,
+  EditableParentFields,
   ExtraOptionRecord,
   ExtraTitleRecord,
   NoteRecord,
@@ -31,6 +34,8 @@ import type {
   Repositories,
   SessionRecord,
   SessionRepo,
+  SurveyAnswer,
+  SurveyResponseRow,
   SurveyRepo,
   UserRecord,
   UserRepo,
@@ -54,10 +59,11 @@ export class MemoryStore {
   caps: number[] = [...DEFAULT_CAPS];
   nextTitleId = 1000;
   nextExtraId = 1000;
-  lotteryRuns: { id: number; seed: string; year: number; caps: number[]; committed: boolean }[] = [];
+  lotteryRuns: { id: number; seed: string; year: number; caps: number[]; committed: boolean; ranAt: Date }[] = [];
   lotteryAssignments: (LotteryAssignmentRow & { runId: number })[] = [];
   settings: AppSettings | null = null;
-  outbox: { id: number; recipient: string; template: string; payload: Record<string, unknown>; state: string; attempts: number; lastError: string | null }[] = [];
+  outbox: { id: number; recipient: string; template: string; payload: Record<string, unknown>; state: string; attempts: number; lastError: string | null; createdAt: Date; sentAt: Date | null }[] = [];
+  documents = new Map<string, DocumentFile>();
   nextOutboxId = 1;
   nextUserId = 1;
   nextChildId = 1;
@@ -102,6 +108,10 @@ class MemParentRepo implements ParentRepo {
   constructor(private s: MemoryStore) {}
   async create(input: ParentRecord) {
     this.s.parents.set(input.parentId, { ...input });
+  }
+  async update(parentId: number, fields: EditableParentFields) {
+    const p = this.s.parents.get(parentId);
+    if (p) Object.assign(p, fields);
   }
   async findById(parentId: number) {
     return this.s.parents.get(parentId) ?? null;
@@ -189,7 +199,7 @@ class MemChildRepo implements ChildRepo {
     const c = this.s.children.get(childId);
     if (c) c.languagePreference = pref;
   }
-  async updateFields(childId: number, fields: Partial<Pick<ChildRecord, 'firstName' | 'middleName' | 'lastName' | 'gender' | 'gradeNextYear'>>) {
+  async updateFields(childId: number, fields: Partial<Pick<ChildRecord, 'firstName' | 'middleName' | 'lastName' | 'gender' | 'gradeNextYear' | 'dob'>>) {
     const c = this.s.children.get(childId);
     if (c) Object.assign(c, fields);
   }
@@ -217,6 +227,44 @@ class MemSurveyRepo implements SurveyRepo {
       }
     }
     return ids;
+  }
+  async childAnswers(childId: number) {
+    const out: SurveyAnswer[] = [];
+    for (const ce of this.s.childExtra) {
+      if (ce.childId !== childId) continue;
+      const ex = this.s.extras.get(ce.extraId);
+      if (!ex) continue;
+      const t = this.s.extraTitles.get(ex.titleId);
+      out.push({ titleId: ex.titleId, question: t?.question ?? '', brief: t?.brief ?? null, value: ex.value });
+    }
+    return out;
+  }
+  async surveyResponses() {
+    const rows: SurveyResponseRow[] = [];
+    // Child registration answers (ChildExtra -> Extra option value).
+    for (const ce of this.s.childExtra) {
+      const ex = this.s.extras.get(ce.extraId);
+      const child = this.s.children.get(ce.childId);
+      const t = ex && this.s.extraTitles.get(ex.titleId);
+      if (!ex || !ex.value || !child || !t) continue;
+      rows.push({
+        titleId: t.titleId, question: t.question, brief: t.brief, lotteryQuestion: t.lotteryQuestion,
+        value: ex.value, subject: `${child.firstName} ${child.lastName}`.trim(),
+        grade: child.gradeNextYear, parentId: child.parentId,
+      });
+    }
+    // Parent lottery answers (ParentExtra free-text/value).
+    for (const pe of this.s.parentExtra) {
+      const t = this.s.extraTitles.get(pe.titleId);
+      const parent = this.s.parents.get(pe.parentId);
+      if (!t || pe.answer == null || pe.answer === '') continue;
+      rows.push({
+        titleId: t.titleId, question: t.question, brief: t.brief, lotteryQuestion: t.lotteryQuestion,
+        value: pe.answer, subject: parent ? `${parent.firstName} ${parent.lastName}`.trim() : `Parent #${pe.parentId}`,
+        grade: null, parentId: pe.parentId,
+      });
+    }
+    return rows;
   }
   async addChildAnswer(childId: number, extraId: number) {
     this.s.childExtra.push({ childId, extraId });
@@ -270,6 +318,24 @@ class MemCurrentStudentRepo implements CurrentStudentRepo {
   async setStatus(childId: number, status: RegStatus) {
     const c = this.s.currentStudents.get(childId);
     if (c) c.regStatus = status;
+  }
+  async all() {
+    return [...this.s.currentStudents.values()];
+  }
+  async findById(childId: number) {
+    return this.s.currentStudents.get(childId) ?? null;
+  }
+  async create(input: Omit<CurrentStudentRecord, 'childId'>) {
+    const childId = Math.max(1000, ...this.s.currentStudents.keys()) + 1;
+    this.s.currentStudents.set(childId, { childId, ...input });
+    return childId;
+  }
+  async update(childId: number, fields: Partial<Omit<CurrentStudentRecord, 'childId'>>) {
+    const c = this.s.currentStudents.get(childId);
+    if (c) Object.assign(c, fields);
+  }
+  async delete(childId: number) {
+    this.s.currentStudents.delete(childId);
   }
 }
 
@@ -339,17 +405,33 @@ class MemCapacityRepo implements CapacityRepo {
   async gradeCaps() {
     return [...this.s.caps];
   }
+  async setCaps(caps: number[]) {
+    this.s.caps = Array.from({ length: 10 }, (_, g) => Math.max(0, Math.trunc(caps[g] ?? this.s.caps[g] ?? 0)));
+  }
 }
 
 class MemLotteryRunRepo implements LotteryRunRepo {
   constructor(private s: MemoryStore) {}
   async createRun(input: { seed: string; year: number; caps: number[]; committed: boolean }) {
     const id = this.s.nextRunId++;
-    this.s.lotteryRuns.push({ id, ...input });
+    this.s.lotteryRuns.push({ id, ...input, ranAt: new Date() });
     return id;
   }
   async addAssignments(runId: number, rows: LotteryAssignmentRow[]) {
     for (const r of rows) this.s.lotteryAssignments.push({ runId, ...r });
+  }
+  async listRuns(limit: number) {
+    return [...this.s.lotteryRuns]
+      .sort((a, b) => b.id - a.id)
+      .slice(0, limit)
+      .map((r) => {
+        const asn = this.s.lotteryAssignments.filter((a) => a.runId === r.id);
+        const count = (s: RegStatus) => asn.filter((a) => a.toStatus === s).length;
+        return {
+          id: r.id, seed: r.seed, year: r.year, ranAt: r.ranAt.toISOString(), committed: r.committed,
+          offered: count(RegStatus.PEND_OFFER), waitlisted: count(RegStatus.WAIT), sibWait: count(RegStatus.SIB_WAIT),
+        };
+      });
   }
 }
 
@@ -367,7 +449,7 @@ class MemOutboxRepo implements OutboxRepo {
   constructor(private s: MemoryStore) {}
   async enqueue(recipient: string, template: string, payload: Record<string, unknown>) {
     const id = this.s.nextOutboxId++;
-    this.s.outbox.push({ id, recipient, template, payload, state: 'pending', attempts: 0, lastError: null });
+    this.s.outbox.push({ id, recipient, template, payload, state: 'pending', attempts: 0, lastError: null, createdAt: new Date(), sentAt: null });
     return id;
   }
   async claimPending(limit: number): Promise<OutboxEmail[]> {
@@ -376,7 +458,7 @@ class MemOutboxRepo implements OutboxRepo {
   }
   async markSent(id: number) {
     const m = this.s.outbox.find((x) => x.id === id);
-    if (m) m.state = 'sent';
+    if (m) { m.state = 'sent'; m.sentAt = new Date(); }
   }
   async markFailed(id: number, error: string, maxAttempts: number) {
     const m = this.s.outbox.find((x) => x.id === id);
@@ -386,6 +468,22 @@ class MemOutboxRepo implements OutboxRepo {
     const out: Record<string, number> = {};
     for (const m of this.s.outbox) out[m.state] = (out[m.state] ?? 0) + 1;
     return out;
+  }
+  async countSentSince(since: Date) {
+    return this.s.outbox.filter((m) => m.state === 'sent' && m.sentAt != null && m.sentAt >= since).length;
+  }
+  async pendingRecipients(template: string) {
+    return new Set(this.s.outbox.filter((m) => m.state === 'pending' && m.template === template).map((m) => m.recipient));
+  }
+  async recent(limit: number, state?: string) {
+    return [...this.s.outbox]
+      .filter((m) => !state || m.state === state)
+      .sort((a, b) => b.id - a.id)
+      .slice(0, limit)
+      .map((m) => ({
+        id: m.id, recipient: m.recipient, template: m.template, state: m.state, attempts: m.attempts,
+        lastError: m.lastError, createdAt: m.createdAt?.toISOString() ?? null, sentAt: m.sentAt?.toISOString() ?? null,
+      }));
   }
 }
 
@@ -434,7 +532,30 @@ export function createMemoryRepositories(store = new MemoryStore()): Repositorie
     settings: new MemSettingsRepo(store),
     maintenance: new MemMaintenanceRepo(store),
     outbox: new MemOutboxRepo(store),
+    documents: new MemDocumentRepo(store),
   };
+}
+
+class MemDocumentRepo implements DocumentRepo {
+  constructor(private s: MemoryStore) {}
+  async list() {
+    return [...this.s.documents.values()].map(({ bytes: _bytes, ...meta }) => meta);
+  }
+  async getMeta(slug: string) {
+    const d = this.s.documents.get(slug);
+    if (!d) return null;
+    const { bytes: _bytes, ...meta } = d;
+    return meta;
+  }
+  async getFile(slug: string) {
+    return this.s.documents.get(slug) ?? null;
+  }
+  async upsert(input: { slug: string; filename: string; contentType: string; bytes: Buffer; size: number; uploadedBy: number | null }) {
+    this.s.documents.set(input.slug, { ...input, uploadedAt: new Date().toISOString() });
+  }
+  async delete(slug: string) {
+    this.s.documents.delete(slug);
+  }
 }
 
 /**
