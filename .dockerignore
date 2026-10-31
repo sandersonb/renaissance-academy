@@ -9,6 +9,11 @@ backend/node_modules/
 .env.*.local
 backend/.env
 
+# Infrastructure state/config and local cutover notes are not application assets.
+infrastructure/
+CUTOVER_CHECKLIST.local.md
+.CUTOVER_CHECKLIST.local.md.sw*
+
 # Build artifacts
 frontend/dist/
 frontend/build/
@@ -50,4 +55,3 @@ Dockerfile
 .editorconfig
 .prettierrc
 .eslintrc
-

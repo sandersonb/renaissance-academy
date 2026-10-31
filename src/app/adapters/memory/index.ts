@@ -6,6 +6,7 @@
 import { randomUUID } from 'node:crypto';
 import { RegStatus } from '../../../domain/regStatus.js';
 import type { Database } from '../../ports/database.js';
+import { nextSessionVersion, validSessionVersion } from '../../util/sessionVersion.js';
 import type {
   AdminRepo,
   AdminUserRecord,
@@ -77,22 +78,35 @@ const norm = (s: string) => s.trim().toLowerCase();
 class MemUserRepo implements UserRepo {
   constructor(private s: MemoryStore) {}
   async findByUsername(username: string) {
-    return [...this.s.users.values()].find((u) => u.username === username) ?? null;
+    const user = [...this.s.users.values()].find((u) => u.username === username);
+    return user ? { ...user } : null;
   }
   async findById(id: number) {
-    return this.s.users.get(id) ?? null;
+    const user = this.s.users.get(id);
+    return user ? { ...user } : null;
   }
-  async create(input: Omit<UserRecord, 'id'>) {
+  async create(input: Omit<UserRecord, 'id' | 'sessionVersion'>) {
     const id = this.s.nextUserId++;
-    this.s.users.set(id, { ...input, id });
+    this.s.users.set(id, { ...input, id, sessionVersion: 0 });
     return id;
   }
+  async lockById(id: number) { return this.findById(id); }
+  async upgradeLegacyPassword(id: number, encpass: string, version: number, hash: string, algo: string) {
+    if (!validSessionVersion(version)) return false;
+    const user = this.s.users.get(id);
+    if (!user || user.encpass !== encpass || !!user.pwHash || user.sessionVersion !== version) return false;
+    user.pwHash = hash; user.pwAlgo = algo;
+    return true;
+  }
+  async replacePassword(id: number, pwHash: string, algo: string, encpass: string | null) {
+    const user = this.s.users.get(id);
+    if (!user) throw new Error('Account missing.');
+    const version = nextSessionVersion(user.sessionVersion);
+    user.pwHash = pwHash; user.pwAlgo = algo; user.sessionVersion = version;
+    if (encpass !== null) user.encpass = encpass;
+  }
   async setPasswordHash(id: number, pwHash: string, algo: string) {
-    const u = this.s.users.get(id);
-    if (u) {
-      u.pwHash = pwHash;
-      u.pwAlgo = algo;
-    }
+    await this.replacePassword(id, pwHash, algo, null);
   }
   async setEncpass(id: number, encpass: string) {
     const u = this.s.users.get(id);
@@ -100,7 +114,8 @@ class MemUserRepo implements UserRepo {
   }
   async setStatus(id: number, status: string) {
     const u = this.s.users.get(id);
-    if (u) u.status = status;
+    if (!u) throw new Error('Account missing.');
+    if (u && u.status !== status) { u.sessionVersion = nextSessionVersion(u.sessionVersion); u.status = status; }
   }
 }
 
@@ -139,6 +154,12 @@ class MemParentRepo implements ParentRepo {
   async setResetToken(parentId: number, token: string | null, expires: Date | null) {
     const p = this.s.parents.get(parentId);
     if (p) { p.resetToken = token; p.resetExpires = expires; }
+  }
+  async consumeResetToken(parentId: number, token: string, now: Date) {
+    const parent = this.s.parents.get(parentId);
+    if (!parent || parent.resetToken !== token || !parent.resetExpires || parent.resetExpires.getTime() <= now.getTime()) return false;
+    parent.resetToken = null; parent.resetExpires = null;
+    return true;
   }
 }
 
@@ -340,13 +361,24 @@ class MemCurrentStudentRepo implements CurrentStudentRepo {
 }
 
 class MemSessionRepo implements SessionRepo {
-  constructor(private map: Map<string, SessionRecord>) {}
-  async create(userId: number, ttlMs: number) {
+  constructor(private store: MemoryStore, private admin = false) {}
+  private get map() { return this.admin ? this.store.adminSessions : this.store.sessions; }
+  private currentVersion(userId: number): number | null {
+    if (this.admin) {
+      const admin = this.store.admins.get(userId);
+      return admin?.active ? admin.sessionVersion : null;
+    }
+    const user = this.store.users.get(userId);
+    return user?.status === 'CONFIRMED' ? user.sessionVersion : null;
+  }
+  async create(userId: number, ttlMs: number, expectedVersion: number) {
+    if (!validSessionVersion(expectedVersion) || this.currentVersion(userId) !== expectedVersion) return null;
     const rec: SessionRecord = {
       token: randomUUID().replace(/-/g, ''),
       userId,
       issuedAt: new Date(),
       expiresAt: new Date(Date.now() + ttlMs),
+      sessionVersion: expectedVersion,
     };
     this.map.set(rec.token, rec);
     return rec;
@@ -354,39 +386,46 @@ class MemSessionRepo implements SessionRepo {
   async find(token: string) {
     const r = this.map.get(token);
     if (!r) return null;
-    if (r.expiresAt.getTime() < Date.now()) {
+    if (!validSessionVersion(r.sessionVersion) || !Number.isFinite(r.expiresAt.getTime()) || r.expiresAt.getTime() <= Date.now() || this.currentVersion(r.userId) !== r.sessionVersion) {
       this.map.delete(token);
       return null;
     }
-    return r;
+    return { ...r };
   }
   async destroy(token: string) {
     this.map.delete(token);
+  }
+  async destroyForUser(userId: number) {
+    for (const [token, record] of this.map) if (record.userId === userId) this.map.delete(token);
   }
 }
 
 class MemAdminRepo implements AdminRepo {
   constructor(private s: MemoryStore) {}
   async findByUsername(u: string) {
-    return [...this.s.admins.values()].find((a) => a.username === u) ?? null;
+    const admin = [...this.s.admins.values()].find((a) => a.username === u);
+    return admin ? { ...admin } : null;
   }
   async findById(id: number) {
-    return this.s.admins.get(id) ?? null;
+    const admin = this.s.admins.get(id);
+    return admin ? { ...admin } : null;
   }
   async create(username: string, pwHash: string, pwAlgo: string) {
     const id = this.s.nextAdminId++;
-    this.s.admins.set(id, { id, username, pwHash, pwAlgo, active: true });
+    this.s.admins.set(id, { id, username, pwHash, pwAlgo, active: true, sessionVersion: 0 });
     return id;
   }
   async countActive() {
     return [...this.s.admins.values()].filter((a) => a.active).length;
   }
   async list() {
-    return [...this.s.admins.values()];
+    return [...this.s.admins.values()].map((admin) => ({ ...admin }));
   }
+  async lockAll() { return (await this.list()).sort((a, b) => a.id - b.id); }
   async setActive(id: number, active: boolean) {
     const a = this.s.admins.get(id);
-    if (a) a.active = active;
+    if (!a) throw new Error('Admin missing.');
+    if (a && a.active !== active) { a.sessionVersion = nextSessionVersion(a.sessionVersion); a.active = active; }
   }
 }
 
@@ -522,10 +561,10 @@ export function createMemoryRepositories(store = new MemoryStore()): Repositorie
     parents: new MemParentRepo(store),
     children: new MemChildRepo(store),
     currentStudents: new MemCurrentStudentRepo(store),
-    sessions: new MemSessionRepo(store.sessions),
+    sessions: new MemSessionRepo(store),
     survey: new MemSurveyRepo(store),
     admins: new MemAdminRepo(store),
-    adminSessions: new MemSessionRepo(store.adminSessions),
+    adminSessions: new MemSessionRepo(store, true),
     notes: new MemNoteRepo(store),
     capacity: new MemCapacityRepo(store),
     lotteryRuns: new MemLotteryRunRepo(store),
@@ -562,29 +601,37 @@ class MemDocumentRepo implements DocumentRepo {
  * In-memory Database with snapshot/restore "transactions" so tests exercise the
  * same atomic semantics: on error, all writes within the work fn are rolled back.
  */
+const transactionQueues = new WeakMap<MemoryStore, Promise<void>>();
+
 export function createMemoryDatabase(store = new MemoryStore()): Database & { store: MemoryStore; repos: Repositories } {
   const repos = createMemoryRepositories(store);
   return {
     store,
     repos,
     async transaction<T>(work: (tx: Repositories) => Promise<T>): Promise<T> {
-      const snap = structuredClone({
-        users: store.users, parents: store.parents, children: store.children,
-        currentStudents: store.currentStudents, sessions: store.sessions,
-        extraTitles: store.extraTitles, extras: store.extras, childExtra: store.childExtra,
-        parentExtra: store.parentExtra, admins: store.admins, adminSessions: store.adminSessions,
-        notes: store.notes, caps: store.caps, lotteryRuns: store.lotteryRuns,
-        lotteryAssignments: store.lotteryAssignments, settings: store.settings, outbox: store.outbox,
-        nextUserId: store.nextUserId, nextChildId: store.nextChildId, nextAdminId: store.nextAdminId,
-        nextNoteId: store.nextNoteId, nextRunId: store.nextRunId, nextTitleId: store.nextTitleId,
-        nextExtraId: store.nextExtraId, nextOutboxId: store.nextOutboxId,
-      });
+      const previous = transactionQueues.get(store) ?? Promise.resolve();
+      let release!: () => void;
+      transactionQueues.set(store, new Promise<void>((resolve) => { release = resolve; }));
+      await previous;
       try {
-        return await work(repos);
-      } catch (e) {
-        Object.assign(store, snap); // restore on failure (rollback)
-        throw e;
-      }
+        const snap = structuredClone({
+          users: store.users, parents: store.parents, children: store.children,
+          currentStudents: store.currentStudents, sessions: store.sessions,
+          extraTitles: store.extraTitles, extras: store.extras, childExtra: store.childExtra,
+          parentExtra: store.parentExtra, admins: store.admins, adminSessions: store.adminSessions,
+          notes: store.notes, caps: store.caps, lotteryRuns: store.lotteryRuns,
+          lotteryAssignments: store.lotteryAssignments, settings: store.settings, outbox: store.outbox,
+          nextUserId: store.nextUserId, nextChildId: store.nextChildId, nextAdminId: store.nextAdminId,
+          nextNoteId: store.nextNoteId, nextRunId: store.nextRunId, nextTitleId: store.nextTitleId,
+          nextExtraId: store.nextExtraId, nextOutboxId: store.nextOutboxId,
+        });
+        try {
+          return await work(repos);
+        } catch (e) {
+          Object.assign(store, snap); // restore on failure (rollback)
+          throw e;
+        }
+      } finally { release(); }
     },
   };
 }

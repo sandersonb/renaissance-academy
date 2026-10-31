@@ -1,0 +1,27 @@
+# Copy to terraform.tfvars (ignored). Use the school's account, not a personal one.
+# Keep actual deployment inventory local; do not add AWS keys or DB passwords.
+aws_region          = "us-west-2"
+aws_profile         = null # Or an existing school AWS profile name; never credentials.
+expected_account_id = "123456789012"
+vpc_id              = "vpc-0123456789abcdef0"
+subnet_id           = "subnet-0123456789abcdef0"
+ami_id              = "ami-0123456789abcdef0" # Pinned Amazon-owned AL2023 ARM64 AMI.
+
+legacy_security_group_name = "REPLACE_WITH_LEGACY_SECURITY_GROUP_NAME"
+rds_security_group_id     = "sg-0123456789abcdef0"
+rds_port                  = 3306 # Confirm actual RDS port before applying.
+
+# For SSH, use an existing key pair and replace example sources with trusted /32s.
+# Leave the map empty to use SSM only (an SSM instance role is provisioned).
+key_name = null
+ssh_ipv4_cidrs = {
+  # "198.51.100.10/32" = "Volunteer admin"
+}
+
+instance_type        = "t4g.micro"
+root_volume_size_gib = 12
+outbound_tcp_ports   = [80, 443, 587] # Add 465 only if the chosen SMTP service needs it.
+
+# Keep false during the private root-cookie preview behind AL1.
+# Enable only after the final public ingress/TLS/admin gates are ready.
+enable_public_web = false

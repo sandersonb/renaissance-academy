@@ -1,5 +1,6 @@
 // Typed client for the enrollment API. Cookies (the session) flow via
 // credentials:'include'; in dev the Vite proxy makes /api same-origin.
+import { requestHeaders } from './requestHeaders';
 
 export type SurveyInputType = 'text' | 'textarea' | 'single_select' | 'multi_select' | 'date';
 
@@ -56,11 +57,18 @@ export class ApiError extends Error {
   }
 }
 
+function responseError(body: unknown, fallback: string): string {
+  if (!body || typeof body !== 'object' || !('error' in body) || typeof body.error !== 'string') return fallback;
+  if (body.error === 'validation' && 'issues' in body && Array.isArray(body.issues)) {
+    return body.issues.filter((issue): issue is string => typeof issue === 'string').join('; ') || fallback;
+  }
+  return body.error || fallback;
+}
+
 async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
   // Only send a JSON content-type when there's actually a body — otherwise the
   // server's JSON parser rejects the empty body (e.g. logout, accept, notify).
-  const headers: Record<string, string> = { ...(opts.headers as Record<string, string> | undefined) };
-  if (opts.body != null && !('content-type' in headers)) headers['content-type'] = 'application/json';
+  const headers = requestHeaders(opts);
   const res = await fetch(`/api${path}`, {
     credentials: 'include',
     ...opts,
@@ -68,8 +76,7 @@ async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const msg = body.error === 'validation' ? (body.issues ?? []).join('; ') : body.error;
-    throw new ApiError(msg || res.statusText, res.status);
+    throw new ApiError(responseError(body, res.statusText), res.status);
   }
   return body as T;
 }
@@ -91,7 +98,7 @@ export const api = {
     post('/auth/forgot', { username, email }) as Promise<{ devToken?: string }>,
   reset: (token: string, password: string) => post('/auth/reset', { token, password }),
   resend: (email: string) => post('/auth/resend', { email }) as Promise<{ devToken?: string }>,
-  me: () => req<Me>('/me'),
+  me: async () => { await post('/me/refresh-offers'); return req<Me>('/me'); },
   documents: () => req<{ documents: ParentDoc[] }>('/me/documents'),
   addChild: (data: Record<string, unknown>) =>
     post('/children', data) as Promise<{ childId: number; status: string; needsLanguagePreference: boolean }>,
@@ -204,11 +211,12 @@ export const adminApi = {
   docDelete: (slug: string) => req(`/admin/documents/${slug}`, { method: 'DELETE' }),
   docUpload: async (slug: string, file: File) => {
     // Raw PDF body (not the JSON helper) — the server parses application/pdf as a Buffer.
+    const options = { method: 'POST', body: file, headers: { 'content-type': 'application/pdf' } };
     const res = await fetch(`/api/admin/documents/${slug}?filename=${encodeURIComponent(file.name)}`, {
-      method: 'POST', credentials: 'include', headers: { 'content-type': 'application/pdf' }, body: file,
+      ...options, credentials: 'include', headers: requestHeaders(options),
     });
     const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new ApiError(body.error || res.statusText, res.status);
+    if (!res.ok) throw new ApiError(responseError(body, res.statusText), res.status);
     return body as { ok: boolean };
   },
   rosterList: (params: { grade?: string | null; name?: string | null }) => {

@@ -3,7 +3,7 @@
  * so the re-enrollment flow can be tested — without the destructive full
  * Roll-New-Year (this only refreshes Current_Student, nothing else).
  *
- *   DB_HOST=127.0.0.1 DB_PORT=3307 DB_USER=root DB_PASSWORD=secret DB_NAME=enrollment \
+ *   NODE_ENV=development DB_TLS_MODE=disabled DB_HOST=127.0.0.1 DB_PORT=3307 DB_USER=root DB_PASSWORD=secret DB_NAME=enrollment \
  *     npm run db:import-roster            # loads db/sample-roster.csv
  *     npm run db:import-roster -- ./my-roster.csv
  *
@@ -15,6 +15,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createMysqlDatabase, createPool } from '../adapters/mysql/index.js';
 import { parseRoster } from '../../domain/rosterCsv.js';
+import { databaseConnectionOptions } from '../adapters/mysql/connectionOptions.js';
 
 async function main() {
   if (!process.env.DB_HOST) throw new Error('DB_HOST not set — importing requires a real database.');
@@ -27,13 +28,7 @@ async function main() {
   }
   if (rows.length === 0) throw new Error('roster is empty');
 
-  const pool = createPool({
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER ?? 'root',
-    password: process.env.DB_PASSWORD ?? '',
-    database: process.env.DB_NAME ?? 'enrollment',
-    port: process.env.DB_PORT ? Number(process.env.DB_PORT) : undefined,
-  });
+  const pool = createPool(databaseConnectionOptions(process.env));
   const db = createMysqlDatabase(pool);
 
   await pool.query('TRUNCATE TABLE `Current_Student`');

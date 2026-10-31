@@ -1,0 +1,31 @@
+{
+  "questions": [
+    { "id": 6, "brief": "K Session", "lottery": 0, "inputType": "single_select", "sortOrder": 0 },
+    { "id": 8, "brief": "Language", "lottery": 0, "inputType": "single_select", "sortOrder": 0 },
+    { "id": 9, "brief": "Language", "lottery": 0, "inputType": "single_select", "sortOrder": 0 },
+    { "id": 10, "brief": "Language", "lottery": 0, "inputType": "single_select", "sortOrder": 0 },
+    { "id": 37, "brief": "chinese_transfer", "lottery": 0, "inputType": "single_select", "sortOrder": 0 },
+    { "id": 11, "brief": "pushmarket", "lottery": 1, "inputType": "multi_select", "sortOrder": 10,
+      "legacyChoices": [
+        "Excellence of our world language program",
+        "Exciting after-school programs (dance, robotics, athletics, drama)",
+        "Small class sizes", "Excellent faculty / academic reputation",
+        "Proximity to your home", "Recommendation from family / friends"
+      ] },
+    { "id": 14, "brief": "extracurricular", "lottery": 1, "inputType": "multi_select", "sortOrder": 20,
+      "legacyChoices": [
+        "Basketball (grades 6-9)", "Soccer (grades 6-9)", "Robotics (grades 5-9)",
+        "Drama (grades 3-9)", "Beginning dance (grades 1-5)",
+        "Drill team / modern dance (grades 6-9)", "Ballroom dance (grades 4-5)",
+        "Ballroom competition team (grades 6-9)", "Art club (grades 3-9)", "Coding club (grades 5-9)"
+      ] },
+    { "id": 17, "brief": "visit_count", "lottery": 1, "inputType": "single_select", "sortOrder": 30,
+      "legacyChoices": ["0", "1", "2 - 3", "4 - 6", "7+"] },
+    { "id": 20, "brief": "referredby", "lottery": 1, "inputType": "text", "sortOrder": 40 },
+    { "id": 23, "brief": "support", "lottery": 1, "inputType": "textarea", "sortOrder": 50 },
+    { "id": 26, "brief": "competition", "lottery": 1, "inputType": "textarea", "sortOrder": 60 },
+    { "id": 29, "brief": "criteria", "lottery": 1, "inputType": "textarea", "sortOrder": 70 },
+    { "id": 32, "brief": "decision_expiry", "lottery": 1, "inputType": "date", "sortOrder": 80 },
+    { "id": 35, "brief": "additional_info", "lottery": 1, "inputType": "textarea", "sortOrder": 90 }
+  ]
+}

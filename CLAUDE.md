@@ -45,10 +45,12 @@ a mysql implementation — keep them in lockstep.
 | Command | What |
 |---|---|
 | `npm test` | Unit tests (in-memory, no DB). Fast. |
-| `npm run test:functional` | End-to-end against real MySQL in Docker. Auto-skips if Docker is absent. |
+| `npm run test:functional` | End-to-end against real MySQL 8.4.11 in owned disposable Docker containers; Docker required. |
 | `npm run typecheck` | `tsc --noEmit` (root). Run `cd web && npx tsc --noEmit` for the web app. |
 | `npm run dev` / `npm start` | API with/without watch. Uses MySQL if `DB_HOST` is set, else an in-memory store. |
-| `npm run db:migrate` | Apply all `db/migrations/*.sql` (idempotent-tolerant). |
+| `npm run db:migrate` | Read-only migration report. Only `-- --apply` writes; history/checksum/lock/failure guards apply. |
+| `npm run db:init-settings` | Separate read-only cycle report; explicit year/open/post flags and `--apply` initialize once. |
+| `npm run db:init-preview` | Fixed empty-preview initialization; read-only by default, explicit apply, unchanged migrations and separately tracked UTF-8 finalization. |
 | `npm run db:seed:pre` / `:post` | Seed a realistic pre- or post-lottery dataset (needs `DB_HOST`). |
 | `npm run admin:create -- --username alice` | Create an admin login. |
 | `cd web && npm run dev` / `npm run build` | React app dev server / production build. |

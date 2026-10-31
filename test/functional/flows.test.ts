@@ -1,21 +1,21 @@
 /**
  * End-to-end functional tests against a REAL MySQL (the mysql2 adapter + the full
  * Fastify server via inject). Reproducible version of the manual docker+curl
- * checks. Auto-skips if Docker isn't available so it never breaks `npm test`.
+ * checks. Docker is required; the default npm test excludes this suite.
  *
  * Run:  npm run test:functional   (needs Docker)
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { Pool, ResultSetHeader } from 'mysql2/promise';
-import { dockerAvailable, startTestMysql, resetData } from './harness.js';
+import { startTestMysql, resetData } from './harness.js';
 import type { AppConfig } from '../../src/app/config.js';
 import { createMysqlDatabase } from '../../src/app/adapters/mysql/index.js';
 import { buildServer } from '../../src/app/http/server.js';
 import { AdminAuthService } from '../../src/app/services/adminAuthService.js';
+import { ConsoleEmailProvider } from '../../src/app/adapters/email/providers.js';
 import type { Repositories } from '../../src/app/ports/repositories.js';
 
-const HAS_DOCKER = dockerAvailable();
 
 const config: AppConfig = {
   yearBegin: 2026, lotteryOpen: true, postLottery: false,
@@ -28,7 +28,7 @@ const json = (payload: unknown, cookie?: string) => ({
   payload: JSON.stringify(payload),
 });
 
-describe.skipIf(!HAS_DOCKER)('functional (real MySQL)', () => {
+describe('functional (real MySQL 8.4)', () => {
   let pool: Pool;
   let stop: () => Promise<void>;
   let repos: Repositories;
@@ -38,7 +38,9 @@ describe.skipIf(!HAS_DOCKER)('functional (real MySQL)', () => {
     ({ pool, stop } = await startTestMysql());
     const database = createMysqlDatabase(pool);
     repos = database.repos;
-    app = buildServer({ config, db: database });
+    // Preserve development-token behavior without logging token-bearing mail.
+    const emailProvider = new class extends ConsoleEmailProvider { async send() {} }();
+    app = buildServer({ config, db: database, emailProvider });
   }, 180_000);
 
   afterAll(async () => {
@@ -85,7 +87,7 @@ describe.skipIf(!HAS_DOCKER)('functional (real MySQL)', () => {
 
     const login = await app.inject({ method: 'POST', url: '/api/auth/login', ...json({ username: 'fp1', password: 'secret1' }) });
     expect(login.statusCode).toBe(200);
-    const cookie = `sid=${login.cookies.find((c) => c.name === 'sid')!.value}`;
+    const cookie = `ra-dev-parent=${login.cookies.find((c) => c.name === 'ra-dev-parent')!.value}`;
 
     const add = await app.inject({ method: 'POST', url: '/api/children',
       ...json({ firstName: 'Sam', lastName: 'One', gender: 'M', dobYear: 2020, dobMonth: 5, dobDay: 1, gradeNextYear: 3 }, cookie) });
@@ -105,7 +107,7 @@ describe.skipIf(!HAS_DOCKER)('functional (real MySQL)', () => {
     const { confirmToken } = reg.json();
     await app.inject({ method: 'POST', url: '/api/auth/confirm', ...json({ token: confirmToken }) }); // returning -> immediate
     const login = await app.inject({ method: 'POST', url: '/api/auth/login', ...json({ username: 'fp2', password: 'secret1' }) });
-    const cookie = `sid=${login.cookies.find((c) => c.name === 'sid')!.value}`;
+    const cookie = `ra-dev-parent=${login.cookies.find((c) => c.name === 'ra-dev-parent')!.value}`;
 
     const add = await app.inject({ method: 'POST', url: '/api/children',
       ...json({ firstName: 'Dana', lastName: 'Roe', gender: 'F', dobYear: 2019, dobMonth: 4, dobDay: 10, current: true }, cookie) });
@@ -123,7 +125,7 @@ describe.skipIf(!HAS_DOCKER)('functional (real MySQL)', () => {
 
     const login = await app.inject({ method: 'POST', url: '/api/admin/login', ...json({ username: 'boss', password: 'adminpass123' }) });
     expect(login.statusCode).toBe(200);
-    const cookie = `asid=${login.cookies.find((c) => c.name === 'asid')!.value}`;
+    const cookie = `ra-dev-admin=${login.cookies.find((c) => c.name === 'ra-dev-admin')!.value}`;
 
     const change = await app.inject({ method: 'POST', url: `/api/admin/children/${childId}/status`, ...json({ status: 'PEND_OFFER' }, cookie) });
     expect(change.statusCode).toBe(200);
@@ -142,7 +144,7 @@ describe.skipIf(!HAS_DOCKER)('functional (real MySQL)', () => {
       await insertChild(p, 0, 'INITIAL', `Kid${i}`);
     }
     const login = await app.inject({ method: 'POST', url: '/api/admin/login', ...json({ username: 'boss', password: 'adminpass123' }) });
-    const cookie = `asid=${login.cookies.find((c) => c.name === 'asid')!.value}`;
+    const cookie = `ra-dev-admin=${login.cookies.find((c) => c.name === 'ra-dev-admin')!.value}`;
     const caps = [3, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
     const preview = await app.inject({ method: 'POST', url: '/api/admin/lottery/preview', ...json({ caps }, cookie) });
@@ -172,7 +174,7 @@ describe.skipIf(!HAS_DOCKER)('functional (real MySQL)', () => {
     const p = await insertParent('prior@example.com');
     await insertChild(p, 3, 'ACPT_REENROLL');
     const login = await app.inject({ method: 'POST', url: '/api/admin/login', ...json({ username: 'boss', password: 'adminpass123' }) });
-    const cookie = `asid=${login.cookies.find((c) => c.name === 'asid')!.value}`;
+    const cookie = `ra-dev-admin=${login.cookies.find((c) => c.name === 'ra-dev-admin')!.value}`;
 
     const csv = 'Last,First,Middle,Sex,Birth,Grade\nSmith,John,,M,10/8/2011,9\nBrown,Sally,Jordan,F,6/5/2012,9';
     const valid = await app.inject({ method: 'POST', url: '/api/admin/roll-year/validate', ...json({ csv }, cookie) });
@@ -193,7 +195,7 @@ describe.skipIf(!HAS_DOCKER)('functional (real MySQL)', () => {
   it('admin: survey manager creates a question that the parent flow then serves', async () => {
     await new AdminAuthService(repos.admins, repos.adminSessions, config).createAdmin('boss', 'adminpass123');
     const login = await app.inject({ method: 'POST', url: '/api/admin/login', ...json({ username: 'boss', password: 'adminpass123' }) });
-    const cookie = `asid=${login.cookies.find((c) => c.name === 'asid')!.value}`;
+    const cookie = `ra-dev-admin=${login.cookies.find((c) => c.name === 'ra-dev-admin')!.value}`;
 
     const create = await app.inject({ method: 'POST', url: '/api/admin/survey/questions',
       ...json({ question: 'Functional Q?', lotteryQuestion: 1, inputType: 'single_select', sortOrder: 1 }, cookie) });
@@ -216,7 +218,7 @@ describe.skipIf(!HAS_DOCKER)('functional (real MySQL)', () => {
     // merged in JS) handles both answer sources against the real schema.
     await new AdminAuthService(repos.admins, repos.adminSessions, config).createAdmin('boss', 'adminpass123');
     const login = await app.inject({ method: 'POST', url: '/api/admin/login', ...json({ username: 'boss', password: 'adminpass123' }) });
-    const cookie = `asid=${login.cookies.find((c) => c.name === 'asid')!.value}`;
+    const cookie = `ra-dev-admin=${login.cookies.find((c) => c.name === 'ra-dev-admin')!.value}`;
 
     // A registration question + option (child answer) and a lottery question (parent answer).
     const [t] = await pool.query<ResultSetHeader>(
@@ -248,7 +250,7 @@ describe.skipIf(!HAS_DOCKER)('functional (real MySQL)', () => {
   it('admin: caps edit, admin management, lottery history, and email log', async () => {
     await new AdminAuthService(repos.admins, repos.adminSessions, config).createAdmin('boss', 'adminpass123');
     const login = await app.inject({ method: 'POST', url: '/api/admin/login', ...json({ username: 'boss', password: 'adminpass123' }) });
-    const cookie = `asid=${login.cookies.find((c) => c.name === 'asid')!.value}`;
+    const cookie = `ra-dev-admin=${login.cookies.find((c) => c.name === 'ra-dev-admin')!.value}`;
 
     // Caps: PUT persists to MaxEnrollment (UPSERT), GET reflects it.
     const put = await app.inject({ method: 'PUT', url: '/api/admin/caps', ...json({ caps: [5, 0, 0, 0, 0, 0, 0, 0, 0, 0] }, cookie) });
@@ -280,7 +282,7 @@ describe.skipIf(!HAS_DOCKER)('functional (real MySQL)', () => {
     const pdf = Buffer.from('%PDF-1.4\nrenaissance test packet\n%%EOF');
     await new AdminAuthService(repos.admins, repos.adminSessions, config).createAdmin('boss', 'adminpass123');
     const adminLogin = await app.inject({ method: 'POST', url: '/api/admin/login', ...json({ username: 'boss', password: 'adminpass123' }) });
-    const adminCookie = `asid=${adminLogin.cookies.find((c) => c.name === 'asid')!.value}`;
+    const adminCookie = `ra-dev-admin=${adminLogin.cookies.find((c) => c.name === 'ra-dev-admin')!.value}`;
 
     // Admin uploads two packets (raw PDF body → stored as LONGBLOB).
     for (const slug of ['family', 'grade_3']) {
@@ -301,7 +303,7 @@ describe.skipIf(!HAS_DOCKER)('functional (real MySQL)', () => {
       ...json({ username: 'docp', password: 'secret1', firstName: 'Doc', lastName: 'Parent', state: 'UT', zip: '84043', email: 'docp@example.com', homePhone: '8015551234', returning: true }) });
     await app.inject({ method: 'POST', url: '/api/auth/confirm', ...json({ token: reg.json().confirmToken }) });
     const pLogin = await app.inject({ method: 'POST', url: '/api/auth/login', ...json({ username: 'docp', password: 'secret1' }) });
-    const pCookie = `sid=${pLogin.cookies.find((c) => c.name === 'sid')!.value}`;
+    const pCookie = `ra-dev-parent=${pLogin.cookies.find((c) => c.name === 'ra-dev-parent')!.value}`;
     const parentId = (await app.inject({ method: 'GET', url: '/api/me', headers: { cookie: pCookie } })).json().parentId;
     await insertChild(parentId, 3, 'PEND_REGISTER');
 
@@ -326,7 +328,7 @@ describe.skipIf(!HAS_DOCKER)('functional (real MySQL)', () => {
     await insertChild(p, 0, 'PEND_OFFER');
 
     const login = await app.inject({ method: 'POST', url: '/api/admin/login', ...json({ username: 'boss', password: 'adminpass123' }) });
-    const cookie = `asid=${login.cookies.find((c) => c.name === 'asid')!.value}`;
+    const cookie = `ra-dev-admin=${login.cookies.find((c) => c.name === 'ra-dev-admin')!.value}`;
 
     const offers = await app.inject({ method: 'POST', url: '/api/admin/notify/offers', headers: { cookie } });
     expect(offers.json()).toEqual({ offers: 1, emails: 1 });

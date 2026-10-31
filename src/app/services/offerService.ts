@@ -44,7 +44,7 @@ export class OfferService {
     return child;
   }
 
-  /** enroll.pl extend_offers_if_necessary: PEND_OFFER -> OFFER + expiration on load. */
+  /** PEND_OFFER -> OFFER + expiration; HTTP invokes this only on explicit parent refresh. */
   async extendOffers(parentId: number): Promise<number> {
     const kids = await this.children.findByParent(parentId);
     let n = 0;

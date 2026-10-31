@@ -13,6 +13,7 @@ export interface UserRecord {
   // additive (new columns):
   pwHash: string | null; // bcrypt
   pwAlgo: string | null;
+  sessionVersion: number;
 }
 
 export interface ParentRecord {
@@ -91,6 +92,7 @@ export interface SessionRecord {
   userId: number;
   issuedAt: Date;
   expiresAt: Date;
+  sessionVersion: number;
 }
 
 export interface AdminUserRecord {
@@ -99,6 +101,7 @@ export interface AdminUserRecord {
   pwHash: string;
   pwAlgo: string;
   active: boolean;
+  sessionVersion: number;
 }
 
 export interface NoteRecord {
@@ -111,7 +114,11 @@ export interface NoteRecord {
 export interface UserRepo {
   findByUsername(username: string): Promise<UserRecord | null>;
   findById(id: number): Promise<UserRecord | null>;
-  create(input: Omit<UserRecord, 'id'>): Promise<number>;
+  create(input: Omit<UserRecord, 'id' | 'sessionVersion'>): Promise<number>;
+  /** Transaction-scoped user row lock; consistent lock order precedes reset-token consumption. */
+  lockById(id: number): Promise<UserRecord | null>;
+  upgradeLegacyPassword(id: number, encpass: string, version: number, pwHash: string, algo: string): Promise<boolean>;
+  replacePassword(id: number, pwHash: string, algo: string, legacyEncpass: string | null): Promise<void>;
   setPasswordHash(id: number, pwHash: string, algo: string): Promise<void>;
   setEncpass(id: number, encpass: string): Promise<void>; // legacy dual-write on reset
   setStatus(id: number, status: string): Promise<void>;
@@ -133,6 +140,7 @@ export interface ParentRepo {
   setConfirmToken(parentId: number, token: string, expires: Date): Promise<void>;
   findByResetToken(token: string): Promise<ParentRecord | null>;
   setResetToken(parentId: number, token: string | null, expires: Date | null): Promise<void>;
+  consumeResetToken(parentId: number, token: string, now: Date): Promise<boolean>;
 }
 
 export interface ChildRepo {
@@ -216,9 +224,12 @@ export interface CurrentStudentRepo {
 }
 
 export interface SessionRepo {
-  create(userId: number, ttlMs: number): Promise<SessionRecord>;
+  /** Atomically issue only for a current active/confirmed principal at the verified version. */
+  create(userId: number, ttlMs: number, expectedVersion: number): Promise<SessionRecord | null>;
+  /** Reject expired, deleted/disabled principal, or version-mismatched sessions. */
   find(token: string): Promise<SessionRecord | null>;
   destroy(token: string): Promise<void>;
+  destroyForUser(userId: number): Promise<void>;
 }
 
 export interface AdminRepo {
@@ -227,6 +238,8 @@ export interface AdminRepo {
   create(username: string, pwHash: string, pwAlgo: string): Promise<number>;
   countActive(): Promise<number>;
   list(): Promise<AdminUserRecord[]>;
+  /** Transaction-scoped ordered locks for last-active-admin protection. */
+  lockAll(): Promise<AdminUserRecord[]>;
   setActive(id: number, active: boolean): Promise<void>;
 }
 

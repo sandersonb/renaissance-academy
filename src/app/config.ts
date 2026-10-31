@@ -4,6 +4,7 @@
  * an `app_settings` table (IMPLEMENTATION_PLAN deviation B6).
  */
 export interface AppConfig {
+  httpSecurity?: HttpSecurityMode;
   /** Enrollment year (legacy `page.pm $year_begin`). school year = year..year+1. */
   yearBegin: number;
   /** Lottery open for new entries (legacy `$lottery_open`). */
@@ -22,9 +23,9 @@ export interface AppConfig {
    *  ChildPermissions all 0). Admin-configurable; default locked. */
   childEditableFields: string[];
   /** App-level admin IP allowlist (defense-in-depth; nginx is the primary gate).
-   *  Empty = allow all (dev). Entries match exactly or as an IP prefix. */
+   *  Empty = allow all only in development. Exact IPs or bounded CIDRs. */
   adminIpAllowlist: string[];
-  /** Trust X-Forwarded-* so request.ip is the real client behind nginx. */
+  /** Trust only the immediate loopback nginx hop, with a single forwarded client IP. */
   trustProxy: boolean;
   /** Email send throttle (Gmail has strict daily + burst limits). The worker
    *  sends at most `emailBatchSize` per drain, waits `emailSendSpacingMs`
@@ -34,10 +35,17 @@ export interface AppConfig {
   emailDailyCap: number;
 }
 
+export interface HttpSecurityMode { production: boolean; realm: 'development' | 'preview' | 'production' }
+export function httpSecurityMode(env: NodeJS.ProcessEnv): HttpSecurityMode {
+  const production = env.NODE_ENV === 'production';
+  return { production, realm: production ? (env.DB_NAME === 'enrollment_preview' ? 'preview' : 'production') : 'development' };
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const num = (v: string | undefined, d: number) => (v ? Number(v) : d);
   const bool = (v: string | undefined, d: boolean) => (v == null ? d : v === 'true' || v === '1');
   return {
+    httpSecurity: httpSecurityMode(env),
     yearBegin: num(env.YEAR_BEGIN, new Date().getFullYear()),
     lotteryOpen: bool(env.LOTTERY_OPEN, true),
     postLottery: bool(env.POST_LOTTERY, false),
@@ -47,7 +55,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     dualWriteLegacyCrypt: bool(env.DUAL_WRITE_LEGACY_CRYPT, true),
     appBaseUrl: env.APP_BASE_URL ?? 'http://localhost:5173',
     childEditableFields: (env.CHILD_EDITABLE_FIELDS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
-    adminIpAllowlist: (env.ADMIN_IP_ALLOWLIST ?? '').split(',').map((s) => s.trim()).filter(Boolean),
+    adminIpAllowlist: env.ADMIN_IP_ALLOWLIST?.trim() ? env.ADMIN_IP_ALLOWLIST.split(',').map((s) => s.trim()) : [],
     trustProxy: bool(env.TRUST_PROXY, false),
     // Defaults tuned for consumer Gmail (~500 msgs/day): 20 per drain, ~1.5s
     // apart, 400/day ceiling. Raise EMAIL_DAILY_CAP for Google Workspace.

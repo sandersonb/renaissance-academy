@@ -5,10 +5,21 @@ system, extended with **additive-only** migrations. Legacy tables and columns ar
 never renamed or dropped, so the Perl app keeps working against the same database
 during cutover.
 
+All new clients require verified TLS by default. See [database TLS](database-tls.md)
+for the public RDS CA, shared API/CLI settings, read-only session diagnostic and
+rotation procedure. Server transport can remain optional for AL1 without weakening
+new-client certificate/hostname verification; changing users/global enforcement
+is a separate approval.
+
 ## Layout
 
 - **`db/schema.sql`** — the base schema (no PII). Use it to create a fresh database.
 - **`db/migrations/00N_*.sql`** — additive migrations, applied in filename order.
+
+The base tables, including `Child`, use **InnoDB**. Production `Child` has
+already been converted; the committed base schema reflects that engine for new
+installations and tests. Verify the actual table engines before cutover rather
+than running a conversion against an already-updated production database.
 
 | Migration | Adds |
 |---|---|
@@ -23,22 +34,27 @@ during cutover.
 
 ## Upgrading the database
 
+The empty isolated preview needs a base before additive migrations. See the
+[preview bootstrap guide](../../db/PREVIEW_BOOTSTRAP.md); `db:init-preview` inspects
+by default and requires separate explicit apply. It creates no families or cycle,
+keeps 001–008 byte-identical and finalizes fresh preview text to utf8mb4_unicode_ci.
+It is not a production charset-conversion or schema-reset tool.
+
 ```bash
 npm run db:migrate
+npm run db:migrate -- --apply   # Only after target/backup review
 ```
 
-- Applies every file in `db/migrations/` in order.
-- **Idempotent** — every statement is `CREATE TABLE IF NOT EXISTS` / additive, so
-  re-running is safe and does nothing when there's nothing new.
-- Run it on every deploy (see [deployment.md](deployment.md)). The API's startup
-  guard checks for the required additive tables and exits with instructions if any
-  are missing.
+- Bare command is **read-only**. Explicit `--apply` executes only pending files
+  under a per-schema lock, recording checksums and durable running/applied/failed
+  states. Repeat applies skip completed migrations, not SQL errors.
+- Changed/missing files, unknown untracked schema and partial failures block.
+  No whole-file DDL rollback is promised. See [recovery and full CLI guide](../../db/README.md).
+- Initial year/open/post settings are a separate insert-only initialization;
+  production refuses to start without them. Migration 006 does not open enrollment.
 
-To apply migrations by hand instead:
-
-```bash
-for f in db/migrations/*.sql; do mysql enrollment < "$f"; done
-```
+Do not loop over SQL files by hand: that bypasses history, companion catalog
+validation/backfill, serialization and recovery controls.
 
 ## Backups
 
@@ -85,3 +101,9 @@ phpMyAdmin is intentionally **removed**. Use the admin portal for day-to-day dat
 work (it covers students, families, roster, caps, admins, etc.). For genuine
 break-glass DB access, connect with the MySQL client using the server's
 credentials (kept out of the repo). Prefer read-only where possible.
+For RDS, use the actual RDS hostname and approved public CA. The host-installed
+MariaDB CLI needs `--ssl --ssl-verify-server-cert --ssl-ca=...`; Oracle MySQL uses
+`--ssl-mode=VERIFY_IDENTITY --ssl-ca=...` instead. Neither consumes the Node
+application's `DB_TLS_*` variables. See the
+[administrator CLI example](../../infrastructure/HOST_SETUP.md#administrator-database-cli)
+for password prompting and disabled local history. Do not put passwords in arguments.

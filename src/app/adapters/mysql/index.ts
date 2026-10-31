@@ -10,6 +10,8 @@ import { randomUUID } from 'node:crypto';
 import mysql, { type Pool, type PoolConnection, type ResultSetHeader, type RowDataPacket } from 'mysql2/promise';
 import type { RegStatus } from '../../../domain/regStatus.js';
 import type { Database } from '../../ports/database.js';
+import type { DatabaseOptions } from './connectionOptions.js';
+import { MAX_SESSION_VERSION, validSessionVersion } from '../../util/sessionVersion.js';
 
 /** Either the pool or a single transaction-scoped connection. */
 type Queryable = Pick<Pool, 'query'>;
@@ -23,14 +25,12 @@ import type {
   UserRecord, UserRepo,
 } from '../../ports/repositories.js';
 
-export interface DbConfig {
-  host: string; user: string; password: string; database: string; port?: number;
-}
+export type DbConfig = DatabaseOptions;
 
 export function createPool(c: DbConfig): Pool {
   return mysql.createPool({
-    host: c.host, user: c.user, password: c.password, database: c.database,
-    port: c.port ?? 3306, dateStrings: true, connectionLimit: 10, namedPlaceholders: false,
+    ...c, dateStrings: true, connectionLimit: 10, namedPlaceholders: false,
+    multipleStatements: false, // Never inherit the migration connection's capability.
   });
 }
 
@@ -41,6 +41,7 @@ const first = <T>(rows: Row[], map: (r: Row) => T): T | null => (rows[0] ? map(r
 const toUser = (r: Row): UserRecord => ({
   id: Number(r.id), username: String(r.username), encpass: String(r.encpass), status: String(r.status),
   pwHash: (r.pw_hash as string) ?? null, pwAlgo: (r.pw_algo as string) ?? null,
+  sessionVersion: Number(r.session_version),
 });
 const toParent = (r: Row): ParentRecord => ({
   parentId: Number(r.Parent_ID), lastName: String(r.Last_Name), firstName: String(r.First_Name),
@@ -78,6 +79,7 @@ const toOption = (r: Row): ExtraOptionRecord => ({
 const toAdmin = (r: Row): AdminUserRecord => ({
   id: Number(r.id), username: String(r.username), pwHash: String(r.pw_hash),
   pwAlgo: String(r.pw_algo), active: !!r.active,
+  sessionVersion: Number(r.session_version),
 });
 const toNote = (r: Row): NoteRecord => ({
   id: Number(r.ID), parentId: Number(r.Parent_ID), date: String(r.Date),
@@ -97,14 +99,27 @@ class SqlUserRepo implements UserRepo {
   constructor(private p: Queryable) {}
   async findByUsername(u: string) { return first(await q(this.p, 'SELECT * FROM users WHERE username=?', [u]), toUser); }
   async findById(id: number) { return first(await q(this.p, 'SELECT * FROM users WHERE id=?', [id]), toUser); }
-  async create(i: Omit<UserRecord, 'id'>) {
+  async create(i: Omit<UserRecord, 'id' | 'sessionVersion'>) {
     const r = await exec(this.p, 'INSERT INTO users (username, encpass, status, pw_hash, pw_algo) VALUES (?,?,?,?,?)',
       [i.username, i.encpass, i.status, i.pwHash, i.pwAlgo]);
     return r.insertId;
   }
-  async setPasswordHash(id: number, h: string, a: string) { await exec(this.p, 'UPDATE users SET pw_hash=?, pw_algo=? WHERE id=?', [h, a, id]); }
+  async lockById(id: number) { return first(await q(this.p, 'SELECT * FROM users WHERE id=? FOR UPDATE', [id]), toUser); }
+  async upgradeLegacyPassword(id: number, encpass: string, version: number, hash: string, algo: string) {
+    if (!validSessionVersion(version)) return false;
+    const result = await exec(this.p, "UPDATE users SET pw_hash=?,pw_algo=? WHERE id=? AND BINARY encpass=BINARY ? AND (pw_hash IS NULL OR pw_hash='') AND session_version=?", [hash, algo, id, encpass, version]);
+    return result.affectedRows === 1;
+  }
+  async replacePassword(id: number, hash: string, algo: string, encpass: string | null) {
+    const result = await exec(this.p, 'UPDATE users SET pw_hash=?,pw_algo=?,encpass=COALESCE(?,encpass),session_version=session_version+1 WHERE id=? AND session_version<?', [hash, algo, encpass, id, MAX_SESSION_VERSION]);
+    if (result.affectedRows !== 1) throw new Error('Session version exhausted or account missing; operator review required.');
+  }
+  async setPasswordHash(id: number, h: string, a: string) { await this.replacePassword(id, h, a, null); }
   async setEncpass(id: number, encpass: string) { await exec(this.p, 'UPDATE users SET encpass=? WHERE id=?', [encpass, id]); }
-  async setStatus(id: number, s: string) { await exec(this.p, 'UPDATE users SET status=? WHERE id=?', [s, id]); }
+  async setStatus(id: number, status: string) {
+    const result = await exec(this.p, 'UPDATE users SET session_version=session_version+(BINARY status<>BINARY ?),status=? WHERE id=? AND (BINARY status=BINARY ? OR session_version<?)', [status, status, id, status, MAX_SESSION_VERSION]);
+    if (result.affectedRows !== 1) throw new Error('Session version exhausted or account missing; operator review required.');
+  }
 }
 
 class SqlParentRepo implements ParentRepo {
@@ -141,8 +156,12 @@ class SqlParentRepo implements ParentRepo {
   }
   async findByConfirmToken(t: string) { return first(await q(this.p, 'SELECT * FROM Parent WHERE confirm_token=?', [t]), toParent); }
   async setConfirmToken(id: number, token: string, expires: Date) { await exec(this.p, 'UPDATE Parent SET confirm_token=?, confirm_expires=? WHERE Parent_ID=?', [token, expires, id]); }
-  async findByResetToken(t: string) { return first(await q(this.p, 'SELECT * FROM Parent WHERE reset_token=?', [t]), toParent); }
+  async findByResetToken(t: string) { return first(await q(this.p, 'SELECT * FROM Parent WHERE reset_token=? AND BINARY reset_token=BINARY ?', [t, t]), toParent); }
   async setResetToken(id: number, token: string | null, expires: Date | null) { await exec(this.p, 'UPDATE Parent SET reset_token=?, reset_expires=? WHERE Parent_ID=?', [token, expires, id]); }
+  async consumeResetToken(id: number, token: string, now: Date) {
+    const result = await exec(this.p, 'UPDATE Parent SET reset_token=NULL,reset_expires=NULL WHERE Parent_ID=? AND BINARY reset_token=BINARY ? AND reset_expires>?', [id, token, now]);
+    return result.affectedRows === 1;
+  }
 }
 
 class SqlChildRepo implements ChildRepo {
@@ -240,22 +259,31 @@ class SqlCurrentStudentRepo implements CurrentStudentRepo {
 
 class SqlSessionRepo implements SessionRepo {
   constructor(private p: Queryable, private table = 'app_sessions') {}
-  async create(userId: number, ttlMs: number) {
+  private get principal() { return this.table === 'admin_sessions' ? 'admin_users' : 'users'; }
+  private get enabled() { return this.table === 'admin_sessions' ? 'p.active=1' : "BINARY p.status=BINARY 'CONFIRMED'"; }
+  async create(userId: number, ttlMs: number, expectedVersion: number) {
+    if (!validSessionVersion(expectedVersion)) return null;
     const token = randomUUID().replace(/-/g, '');
     const expiresAt = new Date(Date.now() + ttlMs);
-    await exec(this.p, `INSERT INTO ${this.table} (token, user_id, issued_at, expires_at) VALUES (?,?,NOW(),?)`, [token, userId, expiresAt]);
-    return { token, userId, issuedAt: new Date(), expiresAt };
+    const result = await exec(this.p, `INSERT INTO ${this.table} (token,user_id,issued_at,expires_at,session_version)
+      SELECT ?,p.id,NOW(),?,p.session_version FROM ${this.principal} p
+      WHERE p.id=? AND p.session_version=? AND ${this.enabled}`, [token, expiresAt, userId, expectedVersion]);
+    if (result.affectedRows !== 1) return null;
+    return { token, userId, issuedAt: new Date(), expiresAt, sessionVersion: expectedVersion };
   }
   async find(token: string) {
-    const r = first(await q(this.p, `SELECT * FROM ${this.table} WHERE token=?`, [token]), (row): SessionRecord => ({
+    const r = first(await q(this.p, `SELECT s.* FROM ${this.table} s JOIN ${this.principal} p ON p.id=s.user_id
+      WHERE s.token=? AND BINARY s.token=BINARY ? AND s.session_version=p.session_version AND ${this.enabled}`, [token, token]), (row): SessionRecord => ({
       token: String(row.token), userId: Number(row.user_id),
       issuedAt: new Date(row.issued_at as string), expiresAt: new Date(row.expires_at as string),
+      sessionVersion: Number(row.session_version),
     }));
     if (!r) return null;
-    if (r.expiresAt.getTime() < Date.now()) { await this.destroy(token); return null; }
+    if (!validSessionVersion(r.sessionVersion) || !Number.isFinite(r.expiresAt.getTime()) || r.expiresAt.getTime() <= Date.now()) { await this.destroy(token); return null; }
     return r;
   }
-  async destroy(token: string) { await exec(this.p, `DELETE FROM ${this.table} WHERE token=?`, [token]); }
+  async destroy(token: string) { await exec(this.p, `DELETE FROM ${this.table} WHERE token=? AND BINARY token=BINARY ?`, [token, token]); }
+  async destroyForUser(userId: number) { await exec(this.p, `DELETE FROM ${this.table} WHERE user_id=?`, [userId]); }
 }
 
 class SqlAdminRepo implements AdminRepo {
@@ -268,7 +296,12 @@ class SqlAdminRepo implements AdminRepo {
   }
   async countActive() { const r = await q(this.p, 'SELECT COUNT(*) AS n FROM admin_users WHERE active=1'); return Number(r[0]?.n ?? 0); }
   async list() { return (await q(this.p, 'SELECT * FROM admin_users ORDER BY username')).map(toAdmin); }
-  async setActive(id: number, active: boolean) { await exec(this.p, 'UPDATE admin_users SET active=? WHERE id=?', [active ? 1 : 0, id]); }
+  async lockAll() { return (await q(this.p, 'SELECT * FROM admin_users ORDER BY id FOR UPDATE')).map(toAdmin); }
+  async setActive(id: number, active: boolean) {
+    const value = active ? 1 : 0;
+    const result = await exec(this.p, 'UPDATE admin_users SET session_version=session_version+(active<>?),active=? WHERE id=? AND (active=? OR session_version<?)', [value, value, id, value, MAX_SESSION_VERSION]);
+    if (result.affectedRows !== 1) throw new Error('Session version exhausted or admin missing; operator review required.');
+  }
 }
 
 class SqlNoteRepo implements NoteRepo {

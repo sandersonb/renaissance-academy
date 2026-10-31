@@ -156,3 +156,15 @@ new/error_log*
 # ...but DO commit the no-PII schema + additive migrations used by Docker/dev.
 !db/schema.sql
 !db/migrations/*.sql
+# Reviewed preview bootstrap inputs only; other SQL dumps remain ignored.
+!db/preview/base.sql
+!db/preview/utf8mb4.sql
+
+# Sanitized source-upload artifact for host setup (not a release to commit).
+/enrollment-source.tar.gz
+
+# Operator-specific configuration and cutover evidence stay local.
+/.gitconfig
+/.idea/
+/CUTOVER_CHECKLIST.local.md
+/.CUTOVER_CHECKLIST.local.md.sw*

@@ -1,11 +1,10 @@
-# Local dev stack: MySQL + API + React. `docker compose up` then open
-# http://localhost:5173. The DB auto-loads the no-PII schema and additive
-# migrations on first init (alphabetical order). node_modules live in named
+# Local dev stack: MySQL + API + React. See README for the explicit migration
+# and cycle-init commands BEFORE starting the API. Only the no-PII base schema
+# auto-loads on a fresh volume; never bypass the migration ledger. node_modules live in named
 # volumes (installed in-container) so host (macOS) binaries don't leak in.
 services:
   db:
-    image: mysql:8.0
-    command: --default-authentication-plugin=mysql_native_password
+    image: mysql:8.4.11
     environment:
       MYSQL_ROOT_PASSWORD: secret
       MYSQL_DATABASE: enrollment
@@ -14,9 +13,6 @@ services:
     volumes:
       - db_data:/var/lib/mysql
       - ./db/schema.sql:/docker-entrypoint-initdb.d/00_schema.sql:ro
-      - ./db/migrations/001_additive.sql:/docker-entrypoint-initdb.d/01_additive.sql:ro
-      - ./db/migrations/002_survey_data.sql:/docker-entrypoint-initdb.d/02_survey_data.sql:ro
-      - ./db/migrations/003_password_reset.sql:/docker-entrypoint-initdb.d/03_reset.sql:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-uroot", "-psecret"]
       interval: 5s
@@ -35,6 +31,8 @@ services:
       DB_USER: root
       DB_PASSWORD: secret
       DB_NAME: enrollment
+      NODE_ENV: development
+      DB_TLS_MODE: disabled
       PORT: "3001"
       APP_BASE_URL: http://localhost:5173
       BCRYPT_COST: "10"

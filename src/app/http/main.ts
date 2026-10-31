@@ -6,6 +6,7 @@
 import { loadConfig } from '../config.js';
 import { createMemoryDatabase, seedSurvey } from '../adapters/memory/index.js';
 import { createMysqlDatabase, createPool } from '../adapters/mysql/index.js';
+import { databaseConnectionOptions } from '../adapters/mysql/connectionOptions.js';
 import type { Database } from '../ports/database.js';
 import { AdminAuthService } from '../services/adminAuthService.js';
 import { OutboxMailer } from '../services/outboxMailer.js';
@@ -13,6 +14,8 @@ import { EmailWorker } from '../services/emailWorker.js';
 import { NotifyService } from '../services/notifyService.js';
 import { emailProviderFromEnv } from '../adapters/email/providers.js';
 import { buildServer } from './server.js';
+import { join } from 'node:path';
+import { loadMigrations, MigrationSafetyError, readCycle, requireCurrentMigrations, type Cycle } from '../adapters/mysql/migrations/engine.js';
 
 const config = loadConfig();
 
@@ -22,17 +25,16 @@ const REQUIRED_ADDITIVE_TABLES = [
 ];
 
 let db: Database;
+let productionCycle: Cycle | null = null;
+if (process.env.NODE_ENV === 'production' && !process.env.DB_HOST) {
+  throw new MigrationSafetyError('Production requires an explicit persistent database; in-memory fallback is disabled.');
+}
 if (process.env.DB_HOST) {
-  const dbName = process.env.DB_NAME ?? 'enrollment';
-  const pool = createPool({
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER ?? 'root',
-    password: process.env.DB_PASSWORD ?? '',
-    database: dbName,
-    port: process.env.DB_PORT ? Number(process.env.DB_PORT) : undefined,
-  });
+  const databaseOptions = databaseConnectionOptions(process.env);
+  const dbName = databaseOptions.database;
+  const pool = createPool(databaseOptions);
   db = createMysqlDatabase(pool);
-  console.log(`using MySQL at ${process.env.DB_HOST}/${dbName}`);
+  console.log(`using MySQL at ${databaseOptions.host}/${dbName}; transport=${databaseOptions.ssl ? 'verified TLS' : 'explicit local plaintext'}`);
 
   // Fail fast if the additive migrations haven't been applied — otherwise the
   // failure surfaces later at a parent's registration + a worker crash-loop.
@@ -45,9 +47,14 @@ if (process.env.DB_HOST) {
   if (missing.length > 0) {
     console.error(
       `\n⚠️  Missing tables: ${missing.join(', ')}.\n` +
-        `    Additive migrations are not applied. Run:  npm run db:migrate\n`,
+        `    Inspect: npm run db:migrate (read-only). Writes require -- --apply.\n`,
     );
     process.exit(1);
+  }
+  if (process.env.NODE_ENV === 'production') {
+    await requireCurrentMigrations(pool, loadMigrations(join(process.cwd(), 'db', 'migrations')));
+    productionCycle = await readCycle(pool);
+    if (!productionCycle) throw new MigrationSafetyError('Production cycle is uninitialized. Inspect db:init-settings, then explicitly initialize reviewed values with --apply.');
   }
 } else {
   const mem = createMemoryDatabase();
@@ -59,7 +66,7 @@ const repos = db.repos;
 
 // B6: app_settings (year / gates) is the source of truth, overriding env at
 // startup. Roll-New-Year writes this table; changes take effect on restart.
-const settings = await repos.settings.get().catch(() => null);
+const settings = productionCycle ?? await repos.settings.get();
 if (settings) {
   config.yearBegin = settings.yearBegin;
   config.lotteryOpen = settings.lotteryOpen;
@@ -67,16 +74,16 @@ if (settings) {
   console.log(`settings: year ${config.yearBegin}, lottery_open=${config.lotteryOpen}, post_lottery=${config.postLottery}`);
 }
 
-// First-boot convenience: create the initial admin from env if none exist.
-const adminAuth = new AdminAuthService(repos.admins, repos.adminSessions, config);
-await adminAuth
-  .bootstrapIfEmpty(process.env.ADMIN_BOOTSTRAP_USER, process.env.ADMIN_BOOTSTRAP_PASSWORD)
-  .then((created) => created && console.log(`bootstrapped initial admin '${process.env.ADMIN_BOOTSTRAP_USER}'`))
-  .catch((e) => console.error('admin bootstrap failed:', e));
-
 // Email: enqueue via the outbox; a background worker drains it via the provider.
 const emailProvider = emailProviderFromEnv();
 const app = buildServer({ config, db, mailer: new OutboxMailer(repos.outbox), emailProvider });
+
+// Validate provider and HTTP boundary before any optional bootstrap write/timers.
+const adminAuth = new AdminAuthService(repos.admins, repos.adminSessions, config);
+await adminAuth
+  .bootstrapIfEmpty(process.env.ADMIN_BOOTSTRAP_USER, process.env.ADMIN_BOOTSTRAP_PASSWORD)
+  .then((created) => created && console.log('Initial admin bootstrap completed.'))
+  .catch(() => console.error('Admin bootstrap failed; inspect protected diagnostics.'));
 
 const worker = new EmailWorker(repos.outbox, emailProvider, {
   batchSize: config.emailBatchSize, spacingMs: config.emailSendSpacingMs, dailyCap: config.emailDailyCap,
@@ -93,7 +100,7 @@ if (reminderMs > 0) {
   const t = setInterval(() => {
     notify.sendReminders()
       .then((r) => r.emails && console.log(`reminders: queued ${r.emails}, skipped ${r.skipped} already-pending`))
-      .catch((e) => console.error('reminder scheduler:', e));
+      .catch(() => console.error('Reminder scheduler failed; inspect protected diagnostics.'));
   }, reminderMs);
   t.unref?.();
   stopReminders = () => clearInterval(t);
@@ -101,10 +108,11 @@ if (reminderMs > 0) {
 for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { stopReminders(); stopWorker(); process.exit(0); });
 
 const port = Number(process.env.PORT ?? 3001);
+const host = process.env.HOST ?? '0.0.0.0';
 app
-  .listen({ port, host: '0.0.0.0' })
+  .listen({ port, host })
   .then((addr) => console.log(`enrollment API listening on ${addr}`))
-  .catch((err) => {
-    console.error(err);
+  .catch(() => {
+    console.error('API listener failed; inspect host configuration.');
     process.exit(1);
   });

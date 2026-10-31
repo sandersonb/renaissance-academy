@@ -1,7 +1,7 @@
 import { defineConfig } from 'vitest/config';
 
-// Functional suite: full stack against a real MySQL in Docker. Auto-skips if
-// Docker isn't available. Single worker (shared DB container) + long timeouts.
+// Functional suite: real disposable MySQL 8.4.11, Docker required (no silent skip).
+// Single worker; each suite owns its unique container and localhost port.
 export default defineConfig({
   test: {
     include: ['test/functional/**/*.test.ts'],

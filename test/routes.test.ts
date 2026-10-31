@@ -35,8 +35,8 @@ describe('parent HTTP flow', () => {
 
     const login = await app.inject({ method: 'POST', url: '/api/auth/login', ...json({ username: 'parentx', password: 'secret1' }) });
     expect(login.statusCode).toBe(200);
-    const sid = login.cookies.find((c) => c.name === 'sid')!.value;
-    const cookie = `sid=${sid}`;
+    const sid = login.cookies.find((c) => c.name === 'ra-dev-parent')!.value;
+    const cookie = `ra-dev-parent=${sid}`;
 
     let me = await app.inject({ method: 'GET', url: '/api/me', headers: { cookie } });
     expect(me.statusCode).toBe(200);

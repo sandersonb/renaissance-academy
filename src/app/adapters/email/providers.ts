@@ -31,10 +31,19 @@ export class SmtpEmailProvider implements EmailProvider {
 
 /** Build the provider from env (defaults to console). */
 export function emailProviderFromEnv(env: NodeJS.ProcessEnv = process.env): EmailProvider {
-  if ((env.EMAIL_PROVIDER ?? 'console') !== 'smtp') return new ConsoleEmailProvider();
-  return new SmtpEmailProvider(env.EMAIL_FROM ?? 'enrollment@renacademy.org', {
+  const kind = env.EMAIL_PROVIDER ?? 'console';
+  if (!['smtp', 'console'].includes(kind) || (env.NODE_ENV === 'production' && kind !== 'smtp')) {
+    throw new Error('EMAIL_PROVIDER must be explicitly smtp in production mode; unknown/console fallback is forbidden.');
+  }
+  if (kind === 'console') return new ConsoleEmailProvider();
+  const port = Number(env.SMTP_PORT ?? 587);
+  if (!Number.isInteger(port) || port < 1 || port > 65535 ||
+      (env.NODE_ENV === 'production' && (!env.SMTP_HOST || !env.EMAIL_FROM || !env.SMTP_USER || !env.SMTP_PASS))) {
+    throw new Error('SMTP connection fields must be explicitly configured and valid; credentials remain on the host.');
+  }
+  return new SmtpEmailProvider(env.EMAIL_FROM ?? 'enrollment@example.org', {
     host: env.SMTP_HOST ?? 'localhost',
-    port: Number(env.SMTP_PORT ?? 587),
+    port,
     user: env.SMTP_USER,
     pass: env.SMTP_PASS,
   });

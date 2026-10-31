@@ -17,6 +17,8 @@ is driven by analysis, not a static port. See:
   [parents](docs/parents/) (applying, offers, paperwork).
 - **[`CLAUDE.md`](CLAUDE.md)** — repo orientation for developers / AI assistants
   (architecture, commands, conventions).
+- **[`infrastructure/`](infrastructure/)** — Terraform for a replacement AL2023
+  ARM64 EC2, dedicated security group, and retained Elastic IP (DNS stays with IT).
 - **[`openspec/`](openspec/)** — spec-driven records: current capability specs
   (`openspec/specs/`) and the rebuild change to be archived at cutover.
 
@@ -58,7 +60,8 @@ repo root for the API).
 against the **existing schema** (additive-only). `main.ts` uses it when `DB_HOST`
 is set, else falls back to in-memory. Additive migrations in `db/migrations`
 (`pw_hash`/`pw_algo`, `confirm_token`, `ExtraTitles.input_type`/`active`/
-`sort_order`, `app_sessions`) applied via `npm run db:migrate`. See `db/README.md`.
+`sort_order`, `app_sessions`) are now inspected via `npm run db:migrate`; only
+`-- --apply` writes tracked upgrades. See `db/README.md`.
 **Integration-verified against real MySQL 8** (Docker): loaded the no-PII schema,
 ran `db:migrate`, and exercised the full flow on the actual schema —
 register → confirm (9-question Type-B survey → `ParentExtra`) → login
@@ -133,16 +136,33 @@ vs the Perl app on a shared DB.* Next: **M6** cutover (Sept–Dec).
 
 **Docker Compose (everything):**
 ```bash
-docker compose up            # MySQL (auto-migrated) + API + React
+# Use a fresh, disposable local project; existing untracked DBs are NOT adopted.
+docker compose -p enrollment-local run --rm api npm ci
+docker compose -p enrollment-local run --rm api npm run db:migrate
+docker compose -p enrollment-local run --rm api npm run db:migrate -- --apply
+# Example local cycle, not an approved production setting:
+docker compose -p enrollment-local run --rm api npm run db:init-settings -- --year=2027 --lottery-open=false --post-lottery=false --apply
+docker compose -p enrollment-local up
 # open http://localhost:5173
 ```
-The DB auto-loads `db/schema.sql` + `db/migrations/*.sql` on first init.
+Only the no-PII base schema auto-loads on a NEW volume. Upgrades and initial
+cycle settings are explicit; see [db/README.md](db/README.md). Never import the
+base dump into production or discard an existing volume without reviewing its data.
+Compose explicitly uses local-development plaintext. Remote RDS connections require
+verified TLS for API and every DB CLI; see [configuration and read-only diagnostic](docs/it/database-tls.md).
+For a fresh, isolated RDS preview, use the [guarded full-Unicode preview bootstrap](db/PREVIEW_BOOTSTRAP.md)
+rather than importing the legacy dump. It is separate from the local Compose fixture
+and refuses production targets, existing schema objects and automatic replay.
 
 **Without Docker:**
 ```bash
 npm install && npm start                      # API on :3001 (in-memory if DB_HOST unset)
 cd web && npm install && npm run dev           # React on :5173 (proxies /api)
-# For a real DB: load db/schema.sql into MySQL, set DB_HOST, run `npm run db:migrate`
+# For a NEW local DB: load db/schema.sql, set explicit DB_*, inspect db:migrate,
+# approve --apply, and explicitly initialize reviewed cycle values. See db/README.md.
+# Commands do not auto-load .env; use Node --env-file=.env or explicit process env.
+# Local plaintext needs NODE_ENV=development plus DB_TLS_MODE=disabled. RDS must
+# use verify_identity with an absolute public CA PEM and its actual DNS endpoint.
 ```
 
 **Sample data** (needs `DB_HOST` + migrations applied):
@@ -163,9 +183,10 @@ no-PII sample in the real import format — you can also upload it in the admin
 ## Tests
 
 ```bash
-npm test              # fast unit/integration suite (in-memory, no Docker) — 64 tests
+npm test              # fast unit/integration suite (in-memory, no Docker)
 npm run typecheck     # tsc --noEmit
-npm run test:functional   # full stack vs REAL MySQL in Docker (auto-managed); auto-skips if no Docker
+npm run test:migrations   # upgrade safety vs real disposable MySQL 8.4.11; Docker required
+npm run test:functional   # full stack + migrations + TLS vs MySQL 8.4.11; Docker/OpenSSL required
 ```
 
 `test/functional/` spins up MySQL in Docker, loads `db/schema.sql` + the additive

@@ -127,15 +127,22 @@ export class AdminService {
     return this.repos.admins.create(username, await hashBcrypt(password, this.config.bcryptCost), PW_ALGO);
   }
   async setAdminActive(id: number, active: boolean, actingAdminId?: number): Promise<void> {
-    const target = await this.repos.admins.findById(id);
-    if (!target) throw new AdminError('No such admin.');
-    if (!active) {
-      if (actingAdminId === id) throw new AdminError('You cannot deactivate your own account.');
-      if (target.active && (await this.repos.admins.countActive()) <= 1) {
-        throw new AdminError('Cannot deactivate the last active admin.');
+    await this.db.transaction(async (tx) => {
+      const admins = await tx.admins.lockAll();
+      const target = admins.find((admin) => admin.id === id);
+      if (!target) throw new AdminError('No such admin.');
+      if (actingAdminId !== undefined && !admins.some((admin) => admin.id === actingAdminId && admin.active)) {
+        throw new AdminError('Acting admin is no longer active.');
       }
-    }
-    await this.repos.admins.setActive(id, active);
+      if (!active) {
+        if (actingAdminId === id) throw new AdminError('You cannot deactivate your own account.');
+        if (target.active && admins.filter((admin) => admin.active).length <= 1) {
+          throw new AdminError('Cannot deactivate the last active admin.');
+        }
+      }
+      await tx.admins.setActive(id, active);
+      if (target.active !== active || !active) await tx.adminSessions.destroyForUser(id);
+    });
   }
 
   // --- Read-only audit views ---

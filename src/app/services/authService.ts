@@ -23,18 +23,18 @@ const US_STATES = new Set(
 );
 
 export const registerSchema = z.object({
-  username: z.string().regex(/^\w{3,}$/, 'Username must be alphanumeric, 3+ chars, no spaces'),
-  password: z.string().min(6, 'Password must be at least 6 characters'),
-  firstName: z.string().min(1),
-  lastName: z.string().min(1),
-  relationship: z.string().default('PARENT'),
-  address: z.string().default(''),
-  city: z.string().default(''),
+  username: z.string().regex(/^\w{3,32}$/, 'Username must be alphanumeric, 3–32 chars, no spaces'),
+  password: z.string().min(6, 'Password must be at least 6 characters').max(72).refine((p) => Buffer.byteLength(p, 'utf8') <= 72, 'Password must be at most 72 UTF-8 bytes.'),
+  firstName: z.string().min(1).max(30),
+  lastName: z.string().min(1).max(30),
+  relationship: z.string().max(10).default('PARENT'),
+  address: z.string().max(45).default(''),
+  city: z.string().max(30).default(''),
   state: z.string().refine((s) => US_STATES.has(s), 'Invalid state'),
-  zip: z.coerce.number().int().nonnegative(),
-  email: z.string().email('Invalid email address'),
-  homePhone: z.string().regex(/^\(?\d{3}\)?\d{3}-?\d{4}$/, 'Invalid phone'),
-  alternateEmail: z.string().email().optional(),
+  zip: z.coerce.number().int().nonnegative().max(16777215),
+  email: z.string().email('Invalid email address').max(128),
+  homePhone: z.string().max(14).regex(/^\(?\d{3}\)?\d{3}-?\d{4}$/, 'Invalid phone'),
+  alternateEmail: z.string().email().max(128).optional(),
   returning: z.boolean().default(false),
 });
 export type RegisterInput = z.infer<typeof registerSchema>;
@@ -163,9 +163,15 @@ export class AuthService {
       if (user.pwHash) {
         ok = await this.pw.verifyBcrypt(password, user.pwHash);
       } else if (this.pw.verifyLegacyCrypt(password, user.encpass)) {
-        ok = true;
-        // Upgrade-on-login: store a bcrypt hash for next time.
-        await this.users.setPasswordHash(user.id, await this.pw.hashBcrypt(password), PW_ALGO);
+        const hash = await this.pw.hashBcrypt(password);
+        ok = await this.users.upgradeLegacyPassword(user.id, user.encpass, user.sessionVersion, hash, PW_ALGO);
+        if (!ok) {
+          // Another legacy login may have completed the upgrade; a reset/status
+          // change must never be overwritten or accepted from this stale snapshot.
+          const current = await this.users.findById(user.id);
+          ok = !!current && current.sessionVersion === user.sessionVersion && !!current.pwHash &&
+            await this.pw.verifyBcrypt(password, current.pwHash);
+        }
       }
     }
     // Same message whether the username is unknown or the password is wrong, so
@@ -175,7 +181,9 @@ export class AuthService {
     if (user.status !== 'CONFIRMED') {
       throw new AuthError('This username has not been validated. Please check your email.');
     }
-    return this.sessions.create(user.id, SESSION_TTL_MS);
+    const session = await this.sessions.create(user.id, SESSION_TTL_MS, user.sessionVersion);
+    if (!session) throw new AuthError('Invalid username or password.');
+    return session;
   }
 
   async logout(token: string): Promise<void> {
@@ -207,13 +215,21 @@ export class AuthService {
 
   async resetPassword(resetToken: string, newPassword: string): Promise<void> {
     if (newPassword.length < 6) throw new AuthError('Password must be at least 6 characters.');
+    if (Buffer.byteLength(newPassword, 'utf8') > 72) throw new AuthError('Password must be at most 72 UTF-8 bytes.');
     const parent = await this.parents.findByResetToken(resetToken);
-    if (!parent || !parent.resetExpires || parent.resetExpires.getTime() < Date.now()) {
+    if (!parent || !parent.resetExpires || parent.resetExpires.getTime() <= Date.now()) {
       throw new AuthError('This reset link is invalid or has expired.');
     }
-    await this.users.setPasswordHash(parent.parentId, await this.pw.hashBcrypt(newPassword), PW_ALGO);
-    if (this.config.dualWriteLegacyCrypt) await this.users.setEncpass(parent.parentId, this.pw.makeLegacyCrypt(newPassword));
-    await this.parents.setResetToken(parent.parentId, null, null);
+    const hash = await this.pw.hashBcrypt(newPassword);
+    const encpass = this.config.dualWriteLegacyCrypt ? this.pw.makeLegacyCrypt(newPassword) : null;
+    await this.db.transaction(async (tx) => {
+      const user = await tx.users.lockById(parent.parentId);
+      if (!user || !await tx.parents.consumeResetToken(parent.parentId, resetToken, new Date())) {
+        throw new AuthError('This reset link is invalid or has expired.');
+      }
+      await tx.users.replacePassword(parent.parentId, hash, PW_ALGO, encpass);
+      await tx.sessions.destroyForUser(parent.parentId);
+    });
   }
 
   /** resend.pl: re-issue the confirmation email for a PENDING account. */

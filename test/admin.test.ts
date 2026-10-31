@@ -112,7 +112,7 @@ describe('AdminService', () => {
     await db.repos.parents.create({
       parentId: 1, firstName: 'John', lastName: 'Snow', relationship: 'Parent', address: '1 Wall',
       city: 'North', state: 'UT', zip: 84043, homePhone: '8015550000', otherPhone: null, returning: false,
-      email: 'j@x.com', alternateEmail: null, guid: null,
+      email: 'j@example.test', alternateEmail: null, guid: null,
       confirmToken: null, confirmExpires: null, resetToken: null, resetExpires: null,
     });
     seedChild(db.store, { parentId: 1, gradeNextYear: 3, regStatus: RegStatus.REGISTER, firstName: 'Arya', lastName: 'Snow' });
@@ -156,7 +156,7 @@ describe('AdminService family CRUD', () => {
     await db.repos.parents.create({
       parentId, firstName: 'John', lastName: 'Snow', relationship: 'Parent', address: '1 Wall',
       city: 'North', state: 'UT', zip: 84043, homePhone: '8015550000', otherPhone: null, returning: false,
-      email: 'j@x.com', alternateEmail: null, guid: null,
+      email: 'j@example.test', alternateEmail: null, guid: null,
       confirmToken: null, confirmExpires: null, resetToken: null, resetExpires: null, ...over,
     } as never);
   };
@@ -179,9 +179,9 @@ describe('AdminService family CRUD', () => {
     const db = createMemoryDatabase();
     await seedParent(db, 5);
     const admin = new AdminService(db, config);
-    await admin.updateParent(5, { email: 'new@x.com', zip: '90210', ignored: 'nope' });
+    await admin.updateParent(5, { email: 'new@example.test', zip: '90210', ignored: 'nope' });
     const p = await db.repos.parents.findById(5);
-    expect(p?.email).toBe('new@x.com');
+    expect(p?.email).toBe('new@example.test');
     expect(p?.zip).toBe(90210);
     expect((await db.repos.notes.listByParent(5)).length).toBe(1);
   });
@@ -358,16 +358,16 @@ describe('AdminService caps / admins / audit views', () => {
 
   it('returns the email log newest-first, filterable by state', async () => {
     const db = createMemoryDatabase();
-    const id1 = await db.repos.outbox.enqueue('a@x.com', 'offer', {});
-    await db.repos.outbox.enqueue('b@x.com', 'reminder', {});
+    const id1 = await db.repos.outbox.enqueue('a@example.test', 'offer', {});
+    await db.repos.outbox.enqueue('b@example.test', 'reminder', {});
     await db.repos.outbox.markSent(id1);
     const admin = new AdminService(db, config);
 
     const all = await admin.emailLog();
     expect(all).toHaveLength(2);
-    expect(all[0]!.recipient).toBe('b@x.com'); // newest (higher id) first
+    expect(all[0]!.recipient).toBe('b@example.test'); // newest (higher id) first
     const sent = await admin.emailLog(50, 'sent');
-    expect(sent.map((m) => m.recipient)).toEqual(['a@x.com']);
+    expect(sent.map((m) => m.recipient)).toEqual(['a@example.test']);
     expect(sent[0]!.sentAt).toBeTruthy();
   });
 });
@@ -375,7 +375,7 @@ describe('AdminService caps / admins / audit views', () => {
 describe('admin IP allowlist (route gate)', () => {
   it('blocks disallowed IPs and lets allowed IPs reach the login', async () => {
     const db = createMemoryDatabase(); const repos = db.repos;
-    const app = buildServer({ config: { ...config, adminIpAllowlist: ['203.0.113'] }, db });
+    const app = buildServer({ config: { ...config, adminIpAllowlist: ['203.0.113.0/24'] }, db });
     const blocked = await app.inject({ method: 'POST', url: '/api/admin/login', remoteAddress: '10.0.0.1', headers: { 'content-type': 'application/json' }, payload: '{}' });
     expect(blocked.statusCode).toBe(403);
     const allowed = await app.inject({ method: 'POST', url: '/api/admin/login', remoteAddress: '203.0.113.9', headers: { 'content-type': 'application/json' }, payload: JSON.stringify({ username: 'x', password: 'y' }) });

@@ -2,7 +2,7 @@
  * Populate a dev/demo database with realistic sample data. Uses the real repos
  * + password hashing so logins work and statuses/bitmasks are valid.
  *
- *   DB_HOST=127.0.0.1 DB_PORT=3307 DB_USER=root DB_PASSWORD=secret DB_NAME=enrollment \
+ *   NODE_ENV=development DB_TLS_MODE=disabled DB_HOST=127.0.0.1 DB_PORT=3307 DB_USER=root DB_PASSWORD=secret DB_NAME=enrollment \
  *     npm run db:seed -- --mode=pre-lottery
  *
  * Modes (default: post-lottery):
@@ -23,7 +23,8 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadConfig } from '../config.js';
-import { createMysqlDatabase, createPool } from '../adapters/mysql';
+import { createMysqlDatabase, createPool } from '../adapters/mysql/index.js';
+import { databaseConnectionOptions } from '../adapters/mysql/connectionOptions.js';
 import type { Database } from '../ports/database.js';
 import { parseRoster } from '../../domain/rosterCsv.js';
 import { Consideration, RegStatus } from '../../domain/regStatus.js';
@@ -54,13 +55,7 @@ const ADMIN_PASSWORD = process.env.SEED_ADMIN_PASSWORD ?? 'admin12345';
 async function main() {
   if (!process.env.DB_HOST) throw new Error('DB_HOST not set — seeding requires a real database.');
   const config = loadConfig();
-  const pool = createPool({
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER ?? 'root',
-    password: process.env.DB_PASSWORD ?? '',
-    database: process.env.DB_NAME ?? 'enrollment',
-    port: process.env.DB_PORT ? Number(process.env.DB_PORT) : undefined,
-  });
+  const pool = createPool(databaseConnectionOptions(process.env));
   const db: Database = createMysqlDatabase(pool);
 
   // --only current-students refreshes just the Current_Student roster.

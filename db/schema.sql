@@ -2,6 +2,7 @@
 -- Derived from a post-purge production dump: table structure + non-PII
 -- reference data only (Extra, ExtraTitles, MaxEnrollment, SiteSettings).
 -- Additive app columns/tables come from db/migrations/*.sql.
+-- Child uses InnoDB to match the current production table engine.
 
 -- MySQL dump 10.13  Distrib 5.6.50, for Linux (x86_64)
 --
@@ -46,7 +47,7 @@ CREATE TABLE `Child` (
   `parent_notes` varchar(4096) COLLATE utf8_unicode_ci NOT NULL,
   PRIMARY KEY (`Child_ID`),
   UNIQUE KEY `position` (`Position`,`Reg_Status`,`Grade_nxt_yr`)
-) ENGINE=MyISAM AUTO_INCREMENT=1062 DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci;
+) ENGINE=InnoDB AUTO_INCREMENT=1062 DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --

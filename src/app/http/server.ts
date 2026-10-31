@@ -26,6 +26,8 @@ import { LotteryError, LotteryService } from '../services/lotteryService.js';
 import { RollYearError, RollYearService } from '../services/rollYearService.js';
 import { DocumentError, DocumentService } from '../services/documentService.js';
 import { AdminSurveyError, AdminSurveyService } from '../services/adminSurveyService.js';
+import { AUTH_BODY_LIMIT, AuthRateLimiter, HttpSecurityError, authCookie, authRate, authToken, httpPolicy, loopbackPeer, normalizedIp, rateKey, sameOriginWrite } from './security.js';
+import { boundedAuthPath, validateAuthBody } from './authValidation.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -39,18 +41,7 @@ export interface ServerDeps {
   db: Database;
   mailer?: Mailer;
   emailProvider?: EmailProvider;
-}
-
-const COOKIE = 'sid';
-
-function parseCookies(header: string | undefined): Record<string, string> {
-  const out: Record<string, string> = {};
-  if (!header) return out;
-  for (const part of header.split(';')) {
-    const i = part.indexOf('=');
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
-  }
-  return out;
+  securityClock?: () => number;
 }
 
 /** The bundled fallback packet served when a slot has no real upload yet.
@@ -89,13 +80,15 @@ function waitlistRank(
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
   const { config, db } = deps;
+  const policy = httpPolicy(config);
   const repos = db.repos;
   const mailer = deps.mailer ?? new OutboxMailer(repos.outbox);
   const emailProvider = deps.emailProvider ?? new ConsoleEmailProvider();
-  // "Dev email" mode = no real delivery (console provider). In this mode only, we
-  // surface confirmation/reset tokens in API responses + the UI so you can verify
-  // without an inbox. With a real (SMTP) provider these are NEVER exposed.
-  const emailDev = emailProvider instanceof ConsoleEmailProvider;
+  // Debug tokens require BOTH development mode and the console provider.
+  if (policy.mode.production && emailProvider instanceof ConsoleEmailProvider) {
+    throw new HttpSecurityError('Production mode forbids console email fallback; configure the reviewed mail provider.', 500);
+  }
+  const emailDev = !policy.mode.production && emailProvider instanceof ConsoleEmailProvider;
   const emailWorker = new EmailWorker(repos.outbox, emailProvider, {
     batchSize: config.emailBatchSize, spacingMs: config.emailSendSpacingMs, dailyCap: config.emailDailyCap,
   });
@@ -110,15 +103,59 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   const rollYear = new RollYearService(db, config);
   const adminSurvey = new AdminSurveyService(repos.survey);
   const documents = new DocumentService(repos, config, loadDefaultPacket());
-  const app = Fastify({ logger: false, trustProxy: config.trustProxy });
+  const app = Fastify({ logger: false, trustProxy: config.trustProxy ? loopbackPeer : false });
+  const limiter = new AuthRateLimiter(deps.securityClock);
+  app.addHook('onRoute', (options) => {
+    if (boundedAuthPath(options.url) && (Array.isArray(options.method) ? options.method.includes('POST') : options.method === 'POST')) options.bodyLimit = AUTH_BODY_LIMIT;
+  });
+  const limited = (reply: FastifyReply, key: string, limit: number, window: number) => {
+    const result = limiter.consume(key, limit, window);
+    if (result.allowed) return false;
+    reply.header('retry-after', String(result.retryAfter)).status(429).send({ error: 'Too many requests; try again later.' });
+    return true;
+  };
+  app.addHook('onRequest', async (req, reply) => {
+    reply.header('referrer-policy', 'no-referrer').header('x-content-type-options', 'nosniff');
+    const path = req.routeOptions.url ?? req.url.split('?')[0]!;
+    if (!path.startsWith('/api/')) return;
+    reply.header('cache-control', 'no-store');
+    if (config.trustProxy && loopbackPeer(req.raw.socket.remoteAddress ?? '')) {
+      const forwarded = req.headers['x-forwarded-for'];
+      if (forwarded !== undefined && (typeof forwarded !== 'string' || !normalizedIp(forwarded))) {
+        return reply.status(400).send({ error: 'Invalid proxy forwarding chain.' });
+      }
+    }
+    if (path.startsWith('/api/admin/') && !policy.adminAllowed(req.ip)) return reply.status(403).send({ error: 'Forbidden' });
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && !sameOriginWrite(req.headers, policy.origin, policy.mode.production)) {
+      return reply.status(403).send({ error: 'Same-origin request required.' });
+    }
+    const rate = req.method === 'POST' ? authRate(path, policy.mode.production) : null;
+    if (rate) {
+      const ip = normalizedIp(req.ip);
+      if (!ip) return reply.status(400).send({ error: 'Invalid request address.' });
+      if (limited(reply, rateKey(`${rate.kind}:ip`, ip), rate.ip, rate.window)) return;
+    }
+  });
+  app.addHook('preValidation', async (req, reply) => {
+    const path = req.routeOptions.url ?? '';
+    if (req.method !== 'POST' || !boundedAuthPath(path)) return;
+    req.body = validateAuthBody(path, req.body);
+    const rate = authRate(path, policy.mode.production);
+    if (rate) for (const field of rate.fields) {
+      const value = (req.body as Record<string, unknown>)[field];
+      if (typeof value === 'string' && limited(reply, rateKey(`${rate.kind}:${field}`, value), rate.identity, rate.window)) return;
+    }
+  });
   // Accept raw PDF uploads (admin paperwork). Body arrives as a Buffer; the
   // upload route raises its own bodyLimit above the default 1 MB.
   app.addContentTypeParser('application/pdf', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
 
   app.setErrorHandler((err, req, reply) => {
     if (err instanceof ZodError) {
-      return reply.status(400).send({ error: 'validation', issues: err.issues.map((i) => i.message) });
+      return reply.status(400).send({ error: 'validation', issues: err.issues.map((i) =>
+        ['unrecognized_keys', 'invalid_enum_value', 'invalid_literal'].includes(i.code) ? 'Invalid request fields.' : i.message) });
     }
+    if (err instanceof HttpSecurityError) return reply.status(err.statusCode).send({ error: err.message });
     if (err instanceof AdminAuthError) {
       return reply.status(401).send({ error: err.message });
     }
@@ -129,32 +166,28 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // instead of masking it as a 500.
     const e = err as { statusCode?: number; message?: string };
     if (typeof e.statusCode === 'number' && e.statusCode >= 400 && e.statusCode < 500) {
-      return reply.status(e.statusCode).send({ error: e.message ?? 'Request error' });
+      return reply.status(e.statusCode).send({ error: e.statusCode === 413 ? 'Request too large.' : 'Invalid request.' });
     }
-    // Unexpected error — log it (with route context) so it isn't silently swallowed.
-    req.log.error({ err, url: req.url, method: req.method }, 'Unhandled request error');
+    // Only fixed category and route template; errors may contain SQL or secrets.
+    req.log.error({ code: 'UNEXPECTED_ERROR', route: req.routeOptions.url, method: req.method }, 'Unhandled request error');
     reply.status(500).send({ error: 'Internal error' });
   });
 
-  // Admin IP allowlist (defense-in-depth; nginx is the primary gate). Empty = allow all.
-  const ipAllowed = (ip: string): boolean => {
-    const list = config.adminIpAllowlist;
-    if (list.length === 0) return true;
-    return list.some((entry) => ip === entry || ip.startsWith(entry));
-  };
+  // Admin IP allowlist (defense-in-depth; nginx is the primary gate).
+  const ipAllowed = policy.adminAllowed;
   const adminIpGate = async (req: FastifyRequest, reply: FastifyReply) => {
     if (!ipAllowed(req.ip)) return reply.status(403).send({ error: 'Forbidden' });
   };
   const requireAdmin = async (req: FastifyRequest, reply: FastifyReply) => {
     if (!ipAllowed(req.ip)) return reply.status(403).send({ error: 'Forbidden' });
-    const token = parseCookies(req.headers.cookie)['asid'];
+    const token = authToken(req.headers.cookie, policy.adminCookie);
     const adminId = await adminAuth.adminIdForSession(token);
     if (!adminId) return reply.status(401).send({ error: 'Admin authentication required' });
     req.adminId = adminId;
   };
 
   const requireAuth = async (req: FastifyRequest, reply: FastifyReply) => {
-    const token = parseCookies(req.headers.cookie)[COOKIE];
+    const token = authToken(req.headers.cookie, policy.parentCookie);
     const userId = await auth.userIdForSession(token);
     if (!userId) return reply.status(401).send({ error: 'Not authenticated' });
     req.userId = userId;
@@ -163,7 +196,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   const setSession = (reply: FastifyReply, token: string, maxAgeSec: number) => {
     reply.header(
       'set-cookie',
-      `${COOKIE}=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAgeSec}`,
+      authCookie(policy.parentCookie, token, maxAgeSec, policy.mode),
     );
   };
 
@@ -246,9 +279,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     return emailDev ? r : {}; // confirm token exposed in dev only
   });
 
-  app.post('/api/auth/logout', { preHandler: requireAuth }, async (req, reply) => {
-    const token = parseCookies(req.headers.cookie)[COOKIE]!;
-    await auth.logout(token);
+  app.post('/api/auth/logout', async (req, reply) => {
+    const token = authToken(req.headers.cookie, policy.parentCookie);
+    if (token) await auth.logout(token);
     setSession(reply, '', 0);
     return { ok: true };
   });
@@ -256,8 +289,6 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // Dashboard (enroll.pl): the logged-in parent's children + status display.
   app.get('/api/me', { preHandler: requireAuth }, async (req) => {
     const userId = req.userId!;
-    // enroll.pl extend_offers_if_necessary: visiting materializes PEND_OFFER -> OFFER.
-    await offers.extendOffers(userId);
     const [parent, children, all] = await Promise.all([
       repos.parents.findById(userId),
       repos.children.findByParent(userId),
@@ -278,6 +309,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         waitlistRank: waitlistRank(c.regStatus, c.position, c.gradeNextYear, all),
       })),
     };
+  });
+
+  app.post('/api/me/refresh-offers', { preHandler: requireAuth }, async (req) => {
+    await offers.extendOffers(req.userId!);
+    return { ok: true };
   });
 
   // Registration paperwork the parent is entitled to (enroll.pl S3 links).
@@ -326,18 +362,18 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   // ---- Admin console (IP-gated + separate admin session) ----
-  const ASID = 'asid';
 
   app.post('/api/admin/login', { preHandler: adminIpGate }, async (req, reply) => {
     const { username, password } = (req.body ?? {}) as { username?: string; password?: string };
     const session = await adminAuth.login(String(username), String(password));
-    reply.header('set-cookie', `${ASID}=${session.token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${12 * 60 * 60}`);
+    reply.header('set-cookie', authCookie(policy.adminCookie, session.token, 12 * 60 * 60, policy.mode));
     return { ok: true };
   });
 
-  app.post('/api/admin/logout', { preHandler: requireAdmin }, async (req, reply) => {
-    await adminAuth.logout(parseCookies(req.headers.cookie)[ASID]!);
-    reply.header('set-cookie', `${ASID}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`);
+  app.post('/api/admin/logout', { preHandler: adminIpGate }, async (req, reply) => {
+    const token = authToken(req.headers.cookie, policy.adminCookie);
+    if (token) await adminAuth.logout(token);
+    reply.header('set-cookie', authCookie(policy.adminCookie, '', 0, policy.mode));
     return { ok: true };
   });
 

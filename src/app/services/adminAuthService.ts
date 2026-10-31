@@ -19,8 +19,9 @@ export class AdminAuthService {
   ) {}
 
   async createAdmin(username: string, password: string): Promise<number> {
-    if (!/^\w{3,}$/.test(username)) throw new AdminAuthError('Username must be alphanumeric, 3+ chars.');
+    if (!/^\w{3,64}$/.test(username)) throw new AdminAuthError('Username must be alphanumeric, 3–64 chars.');
     if (password.length < 8) throw new AdminAuthError('Admin password must be at least 8 characters.');
+    if (Buffer.byteLength(password, 'utf8') > 72) throw new AdminAuthError('Admin password must be at most 72 UTF-8 bytes.');
     if (await this.admins.findByUsername(username)) throw new AdminAuthError(`Admin '${username}' already exists.`);
     return this.admins.create(username, await hashBcrypt(password, this.config.bcryptCost), PW_ALGO);
   }
@@ -38,7 +39,9 @@ export class AdminAuthService {
     if (!admin || !admin.active || !(await verifyBcrypt(password, admin.pwHash))) {
       throw new AdminAuthError('Invalid admin credentials.');
     }
-    return this.sessions.create(admin.id, SESSION_TTL_MS);
+    const session = await this.sessions.create(admin.id, SESSION_TTL_MS, admin.sessionVersion);
+    if (!session) throw new AdminAuthError('Invalid admin credentials.');
+    return session;
   }
 
   async logout(token: string): Promise<void> {
